@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from playwright.async_api import async_playwright, Page, Response
 
 BASE_URL = "https://kyou.net.cn/songs"
+CF_PROBE_URL = "https://kyou.net.cn/api/tags/tree"
 
 PRIMARY_TAGS = {"综合", "读谱", "硬抗", "拆谱", "定位", "多指"}
 SECONDARY_TAGS = {
@@ -366,6 +367,105 @@ class Recorder:
         except Exception:
             return
 
+
+
+async def warm_up_cloudflare(page: Page, out: Path, timeout_ms: int = 45000) -> dict[str, Any]:
+    """Navigate to a protected API endpoint so Cloudflare can run its browser challenge.
+
+    fetch/XHR challenges return HTML to JavaScript and are never executed. A top-level
+    navigation gives Cloudflare a real page where its challenge script can run and, on
+    success, set the clearance cookie for subsequent API requests.
+    """
+    result: dict[str, Any] = {
+        "url": CF_PROBE_URL,
+        "attempted": True,
+        "passed": False,
+        "status": None,
+        "content_type": "",
+        "final_url": "",
+        "title": "",
+        "body_prefix": "",
+        "clearance_cookie": False,
+    }
+
+    try:
+        response = await page.goto(CF_PROBE_URL, wait_until="domcontentloaded", timeout=90000)
+        if response is not None:
+            result["status"] = response.status
+            result["content_type"] = (response.headers.get("content-type") or "").lower()
+
+        deadline = time.monotonic() + timeout_ms / 1000
+        while time.monotonic() < deadline:
+            await page.wait_for_timeout(1000)
+            try:
+                title = await page.title()
+                body = (await page.locator("body").inner_text())[:4000]
+            except Exception:
+                title, body = "", ""
+
+            cookies = await page.context.cookies()
+            has_clearance = any(c.get("name") == "cf_clearance" for c in cookies)
+            challenge = (
+                "Just a moment" in title
+                or "Enable JavaScript and cookies to continue" in body
+                or "cf-chl" in (await page.content())[:12000]
+            )
+
+            result.update({
+                "final_url": page.url,
+                "title": title,
+                "body_prefix": body[:1000],
+                "clearance_cookie": has_clearance,
+            })
+
+            # The API JSON may be rendered as plain text in the browser. Any non-challenge
+            # page after the direct navigation is enough to retry the app.
+            if not challenge:
+                result["passed"] = True
+                break
+
+        (out / "cloudflare.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        try:
+            (out / "cloudflare.html").write_text(await page.content(), encoding="utf-8")
+        except Exception:
+            pass
+        return result
+    except Exception as e:
+        result["error"] = repr(e)
+        (out / "cloudflare.json").write_text(
+            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        return result
+
+
+async def wait_for_song_page(page: Page, retries: int = 3) -> str:
+    """Wait for the song page; retry its own retry button when API startup races."""
+    last_body = ""
+    for attempt in range(retries + 1):
+        try:
+            await page.wait_for_timeout(1500 if attempt == 0 else 1000)
+            last_body = await page.locator("body").inner_text()
+        except Exception:
+            last_body = ""
+
+        if "无法加载曲目列表" not in last_body and "加载失败" not in last_body:
+            return last_body
+
+        if attempt < retries:
+            try:
+                retry = page.get_by_text("重试", exact=True)
+                if await retry.count():
+                    await retry.first.click(timeout=3000)
+                    await page.wait_for_timeout(2000)
+                    continue
+            except Exception:
+                pass
+            await page.reload(wait_until="domcontentloaded", timeout=90000)
+
+    return last_body
+
 async def dump_web_storage(page: Page, out: Path, normalizer: Normalizer) -> None:
     storage = await page.evaluate("""() => {
       const read = (s) => {
@@ -652,32 +752,40 @@ async def run(args: argparse.Namespace) -> int:
     normalizer = Normalizer()
     recorder = Recorder(out, normalizer)
 
+    cf_result: dict[str, Any] = {}
+    body = ""
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=not args.headful)
         context = await browser.new_context(
             viewport={"width": 1440, "height": 1000},
             locale="zh-CN",
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/151 Safari/537.36",
         )
         page = await context.new_page()
         page.on("response", recorder.schedule_response)
 
-        print(f"[1/5] 打开 {BASE_URL}")
+        print(f"[0/6] Cloudflare 预热：{CF_PROBE_URL}")
+        cf_result = await warm_up_cloudflare(page, out, args.cf_timeout_ms)
+        print(json.dumps(cf_result, ensure_ascii=False))
+
+        print(f"[1/6] 打开 {BASE_URL}")
         await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=90000)
         try:
             await page.wait_for_load_state("networkidle", timeout=30000)
         except Exception:
             pass
+        body = await wait_for_song_page(page, retries=3)
 
-        print("[2/5] 自动滚动，触发列表懒加载")
-        await auto_scroll(page)
-        await page.wait_for_timeout(800)
+        print("[2/6] 自动滚动，触发列表懒加载")
+        if "无法加载曲目列表" not in body and "加载失败" not in body:
+            await auto_scroll(page)
+            await page.wait_for_timeout(800)
+            body = await page.locator("body").inner_text()
 
-        body = await page.locator("body").inner_text()
         (out / "body.txt").write_text(body, encoding="utf-8")
         (out / "page.html").write_text(await page.content(), encoding="utf-8")
 
-        print("[3/5] 读取 localStorage / sessionStorage / IndexedDB")
+        print("[3/6] 读取 localStorage / sessionStorage / IndexedDB")
         await dump_web_storage(page, out, normalizer)
         try:
             await dump_indexeddb(page, out, normalizer)
@@ -686,7 +794,7 @@ async def run(args: argparse.Namespace) -> int:
 
         clicked = 0
         if args.deep:
-            print(f"[4/5] 深度探索：最多点击 {args.max_clicks} 个疑似歌曲卡片")
+            print(f"[4/6] 深度探索：最多点击 {args.max_clicks} 个疑似歌曲卡片")
             clicked = await click_explore(page, out, args.max_clicks, args.delay_ms)
             await recorder.drain()
             # Clicks may populate browser caches.
@@ -696,21 +804,30 @@ async def run(args: argparse.Namespace) -> int:
             except Exception:
                 pass
         else:
-            print("[4/5] 跳过深度点击（加 --deep 可启用）")
+            print("[4/6] 跳过深度点击（加 --deep 可启用）")
 
         await recorder.drain()
         await browser.close()
 
-    print("[5/5] 归一化并写出 CSV / JSON")
+    print("[5/6] 归一化并写出 CSV / JSON")
     write_outputs(out, normalizer, recorder, clicked, started_at)
 
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+    manifest["cloudflare"] = cf_result
+    manifest["page_load_failed"] = ("无法加载曲目列表" in body or "加载失败" in body)
+    (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
 
-    # Don't fail merely because site schema differs; raw data is still useful.
+    print("[6/6] 完整性检查")
+    if not cf_result.get("passed") or manifest["page_load_failed"]:
+        print("错误：Cloudflare 挑战未通过，曲目 API 仍被拦截。诊断文件已保留。", file=sys.stderr)
+        return 3
     if manifest["raw_responses"] == 0:
-        print("警告：没有捕获到数据响应；请用 --headful --deep 再跑一次。", file=sys.stderr)
+        print("错误：没有捕获到数据响应。", file=sys.stderr)
         return 2
+    if manifest["songs_rows"] == 0 and manifest["charts_rows"] == 0 and manifest["tag_vote_rows"] == 0:
+        print("错误：已通过页面加载，但归一化结果仍为空；请检查 raw/ 后补字段映射。", file=sys.stderr)
+        return 4
     return 0
 
 def parse_args() -> argparse.Namespace:
@@ -719,7 +836,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--deep", action="store_true", help="自动点击疑似歌曲卡片，触发详情/投票懒加载")
     ap.add_argument("--max-clicks", type=int, default=2200, help="深度模式最多点击数量")
     ap.add_argument("--delay-ms", type=int, default=250, help="每次点击后的等待，默认 250ms")
-    ap.add_argument("--headful", action="store_true", help="显示浏览器窗口，调试时使用")
+    ap.add_argument("--headful", action="store_true", help="显示浏览器窗口；GitHub Actions 建议配合 xvfb-run")
+    ap.add_argument("--cf-timeout-ms", type=int, default=45000, help="等待 Cloudflare 浏览器挑战的最长时间")
     return ap.parse_args()
 
 if __name__ == "__main__":

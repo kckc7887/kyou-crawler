@@ -23,12 +23,17 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m playwright install --with-deps chromium
 
+      - name: Install virtual display
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+
       - name: Crawl
-        run: python crawler.py --deep --out output
+        run: xvfb-run -a python crawler.py --deep --headful --out output
 
       - name: Upload crawl artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: kyou-data
           path: output/
           retention-days: 7
+          if-no-files-found: warn

@@ -62,3 +62,20 @@ py -m venv .venv; .\.venv\Scripts\Activate.ps1; py -m pip install -r .\requireme
 以及打开 `output\endpoints.txt`，这里就是脚本实际观察到的数据请求。
 
 如果归一化表某列为空，但 `raw/` 里有数据，说明只是字段名没命中规则，不代表没抓到。把对应 raw JSON 的一小段结构提供出来即可精确补 parser。
+
+
+## v2：Cloudflare 处理
+
+GitHub 托管 Runner 可能会让 `https://kyou.net.cn/api/tags/tree` 返回 Cloudflare 的 `403 Just a moment...`。
+
+v2 会先把该 API 作为顶层页面打开，让浏览器有机会执行 Cloudflare 的浏览器挑战；通过后再进入 `/songs`。GitHub Actions 使用 `xvfb-run + --headful` 运行真实有界面 Chromium。
+
+如果 Cloudflare 仍拒绝 GitHub 的机房 IP，任务会明确失败（不会再出现“绿了但 0 条数据”），同时 `if: always()` 保留完整 Artifact 供诊断。
+
+运行结果新增：
+
+- `cloudflare.json`：挑战通过情况、状态码、是否获得 `cf_clearance`
+- `cloudflare.html`：挑战最后页面
+- `manifest.json.page_load_failed`：曲目页是否仍加载失败
+
+如果 v2 仍持续返回 Cloudflare 403，说明站点策略直接拒绝 GitHub 托管 Runner 的出口 IP。此时最稳定的做法是换 GitHub self-hosted runner（你的电脑/家里小主机）或其他允许访问该站点的固定运行环境，而不是继续堆解析规则。
