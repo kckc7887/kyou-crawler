@@ -1,0 +1,141 @@
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -1 +1,2 @@
+ playwright==1.55.0
++boto3>=1.35,<2
+--- a/.github/workflows/crawl.yml
++++ b/.github/workflows/crawl.yml
+@@ -39,6 +39,16 @@
+           if [ "${{ inputs.tree_fallback }}" = "true" ]; then EXTRA="--tree-fallback"; fi
+           xvfb-run -a python crawler.py --headful --out output $EXTRA
+ 
++      - name: Upload to Rainyun ROS
++        if: success()
++        env:
++          RAINYUN_ENDPOINT: ${{ secrets.RAINYUN_ENDPOINT }}
++          RAINYUN_BUCKET: ${{ secrets.RAINYUN_BUCKET }}
++          RAINYUN_ACCESS_KEY: ${{ secrets.RAINYUN_ACCESS_KEY }}
++          RAINYUN_SECRET_KEY: ${{ secrets.RAINYUN_SECRET_KEY }}
++          RAINYUN_PREFIX: kyou/latest
++        run: python upload_to_rainyun.py output
++
+       - name: Upload crawl artifact
+         if: always()
+         uses: actions/upload-artifact@v4
+--- /dev/null
++++ b/upload_to_rainyun.py
+@@ -0,0 +1,114 @@
++from __future__ import annotations
++
++import json
++import mimetypes
++import os
++import sys
++from pathlib import Path
++
++import boto3
++from botocore.config import Config
++
++FILES = [
++    "songs.json",
++    "songs.csv",
++    "aliases.json",
++    "aliases.csv",
++    "charts.json",
++    "charts.csv",
++    "tag_votes.json",
++    "tag_votes.csv",
++    "tag_catalog.json",
++    "tag_catalog.csv",
++    "data.json",
++    "manifest.json",
++]
++
++
++def required_env(name: str) -> str:
++    value = os.getenv(name, "").strip()
++    if not value:
++        raise SystemExit(f"缺少环境变量: {name}")
++    return value
++
++
++def content_type(path: Path) -> str:
++    if path.suffix.lower() == ".json":
++        return "application/json; charset=utf-8"
++    if path.suffix.lower() == ".csv":
++        return "text/csv; charset=utf-8"
++    return mimetypes.guess_type(path.name)[0] or "application/octet-stream"
++
++
++def main() -> int:
++    local_dir = Path(sys.argv[1] if len(sys.argv) > 1 else "output")
++    if not local_dir.is_dir():
++        raise SystemExit(f"输出目录不存在: {local_dir}")
++
++    endpoint = required_env("RAINYUN_ENDPOINT").rstrip("/")
++    bucket = required_env("RAINYUN_BUCKET")
++    access_key = required_env("RAINYUN_ACCESS_KEY")
++    secret_key = required_env("RAINYUN_SECRET_KEY")
++    prefix = os.getenv("RAINYUN_PREFIX", "kyou/latest").strip("/")
++
++    s3 = boto3.client(
++        "s3",
++        endpoint_url=endpoint,
++        aws_access_key_id=access_key,
++        aws_secret_access_key=secret_key,
++        region_name="rainyun",
++        config=Config(
++            signature_version="s3v4",
++            s3={"addressing_style": "path"},
++            retries={"max_attempts": 4, "mode": "standard"},
++        ),
++    )
++
++    existing = [name for name in FILES if (local_dir / name).is_file()]
++    missing = [name for name in FILES if not (local_dir / name).is_file()]
++
++    # manifest 最后上传。消费者可把 manifest.json 的更新时间视为本次刷新完成。
++    ordered = [name for name in existing if name != "manifest.json"]
++    if "manifest.json" in existing:
++        ordered.append("manifest.json")
++
++    if not ordered:
++        raise SystemExit("没有找到可上传的数据文件")
++
++    print(f"Endpoint: {endpoint}")
++    print(f"Bucket: {bucket}")
++    print(f"Prefix: {prefix}")
++
++    for name in ordered:
++        src = local_dir / name
++        key = f"{prefix}/{name}" if prefix else name
++        s3.upload_file(
++            str(src),
++            bucket,
++            key,
++            ExtraArgs={"ContentType": content_type(src)},
++        )
++        head = s3.head_object(Bucket=bucket, Key=key)
++        remote_size = int(head.get("ContentLength", -1))
++        local_size = src.stat().st_size
++        if remote_size != local_size:
++            raise RuntimeError(
++                f"上传后大小校验失败: {name} local={local_size} remote={remote_size}"
++            )
++        print(f"OK  {name} -> s3://{bucket}/{key} ({local_size} bytes)")
++
++    if missing:
++        print("跳过不存在的可选文件:", ", ".join(missing))
++
++    summary = {
++        "bucket": bucket,
++        "prefix": prefix,
++        "uploaded": ordered,
++        "count": len(ordered),
++    }
++    print(json.dumps(summary, ensure_ascii=False))
++    return 0
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())

@@ -39,6 +39,16 @@ jobs:
           if [ "${{ inputs.tree_fallback }}" = "true" ]; then EXTRA="--tree-fallback"; fi
           xvfb-run -a python crawler.py --headful --out output $EXTRA
 
+      - name: Upload to Rainyun ROS
+        if: success()
+        env:
+          RAINYUN_ENDPOINT: ${{ secrets.RAINYUN_ENDPOINT }}
+          RAINYUN_BUCKET: ${{ secrets.RAINYUN_BUCKET }}
+          RAINYUN_ACCESS_KEY: ${{ secrets.RAINYUN_ACCESS_KEY }}
+          RAINYUN_SECRET_KEY: ${{ secrets.RAINYUN_SECRET_KEY }}
+          RAINYUN_PREFIX: kyou/latest
+        run: python upload_to_rainyun.py output
+
       - name: Upload crawl artifact
         if: always()
         uses: actions/upload-artifact@v4
