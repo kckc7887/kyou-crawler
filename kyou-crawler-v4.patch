@@ -1,0 +1,1917 @@
+diff --git a/.github/workflows/crawl.yml b/.github/workflows/crawl.yml
+index bc25846..9a9681a 100644
+--- a/.github/workflows/crawl.yml
++++ b/.github/workflows/crawl.yml
+@@ -2,6 +2,12 @@ name: Crawl kyou data
+ 
+ on:
+   workflow_dispatch:
++    inputs:
++      tree_fallback:
++        description: "批量标签接口失败时，允许逐张谱面 GET（请求量较大，仅调试时打开）"
++        required: false
++        type: boolean
++        default: false
+   schedule:
+     - cron: "17 * * * *"
+ 
+@@ -11,7 +17,7 @@ permissions:
+ jobs:
+   crawl:
+     runs-on: ubuntu-latest
+-    timeout-minutes: 45
++    timeout-minutes: 55
+     steps:
+       - uses: actions/checkout@v4
+ 
+@@ -27,7 +33,11 @@ jobs:
+         run: sudo apt-get update && sudo apt-get install -y xvfb
+ 
+       - name: Crawl
+-        run: xvfb-run -a python crawler.py --deep --headful --out output
++        shell: bash
++        run: |
++          EXTRA=""
++          if [ "${{ inputs.tree_fallback }}" = "true" ]; then EXTRA="--tree-fallback"; fi
++          xvfb-run -a python crawler.py --headful --out output $EXTRA
+ 
+       - name: Upload crawl artifact
+         if: always()
+diff --git a/README.md b/README.md
+index 4d553e6..f798b31 100644
+--- a/README.md
++++ b/README.md
+@@ -1,96 +1,61 @@
+-# kyou-crawler
++# kyou-crawler v4
+ 
+-抓取 `https://kyou.net.cn/songs` 当前页面实际加载的数据，并整理出：
++抓取 `https://kyou.net.cn` 的 Phigros 定数表、别名以及谱面标签投票。
+ 
+-- `songs.csv/json`：歌曲
+-- `aliases.csv/json`：别名
+-- `charts.csv/json`：谱面
+-- `tag_votes.csv/json`：主/次标签与票数
+-- `network.json` / `endpoints.txt`：实际捕获到的接口
+-- `raw/`：原始接口响应
+-- `web_storage.json`：localStorage / sessionStorage
+-- `indexeddb.json`：IndexedDB
+-- `detail_snapshots.ndjson`：深度模式点击详情后看到的文本快照
++v4 不再依赖 `/songs` 页面 DOM。根据站点当前前端 bundle 逆出的真实接口直接取数：
+ 
+-## 安装
++- `GET /api/songs/songlist`：歌曲、别名、各难度定数
++- `GET /api/tags/tree`：标签目录
++- `POST /api/tags/top-batch`：批量谱面标签票数、主标签汇总
++- `GET /api/tags/tree?songId=...&difficulty=...`：单谱完整投票（仅作为备用）
+ 
+-PowerShell：
++## 为什么要“隔离浏览器上下文”
+ 
+-```powershell
+-py -m venv .venv; .\.venv\Scripts\Activate.ps1; py -m pip install -r .\requirements.txt; py -m playwright install chromium
+-```
+-
+-## 运行
+-
+-建议第一次直接深度抓取：
+-
+-```powershell
+-.\.venv\Scripts\Activate.ps1; py .\crawler.py --deep
+-```
+-
+-调试（显示 Chromium）：
+-
+-```powershell
+-.\.venv\Scripts\Activate.ps1; py .\crawler.py --deep --headful
+-```
+-
+-输出默认在 `output\`。
+-
+-## 为什么同时保留 raw / IndexedDB
+-
+-这个站点是动态页面，而且页面明确存在缓存行为。爬虫不把成功与否押在某一个 API 路径或某一套 DOM class 上：
+-
+-1. 监听 `fetch/XHR/document`；
+-2. 自动滚动触发懒加载；
+-3. 抽取 localStorage / sessionStorage；
+-4. 抽取所有 IndexedDB 数据库；
+-5. `--deep` 时自动点击高概率歌曲卡片以触发详情、标签、评论等延迟请求；
+-6. 对所有结构化数据递归归一化。
++GitHub Hosted Runner 上，Cloudflare 对 `/songs` 内部的 `fetch` 会返回 403，但干净 Chromium 上下文的第一个顶层 API 请求可以通过。v4 因此让关键 API 调用在新的浏览器上下文中执行。
+ 
+-即使站点字段改名，`raw/` 仍保留原始响应，后续只需修 parser，不需要重新猜接口。
++对于批量 POST，v4 有两种尝试：
+ 
+-## 建议的首次验证
++1. 把顶层文档导航在浏览器请求层改写成 JSON POST；
++2. 使用本地 fulfilled 的同源 bootstrap 页面，让 POST fetch 成为新上下文的第一个真实网络请求。
+ 
+-跑完看 `output\manifest.json`。重点是：
++这样不需要逐个点击 1600+ 首歌。
+ 
+-- `raw_responses` > 0
+-- `songs_rows`
+-- `aliases_rows`
+-- `charts_rows`
+-- `tag_vote_rows`
++## 输出
+ 
+-以及打开 `output\endpoints.txt`，这里就是脚本实际观察到的数据请求。
++成功时 `output/` 包含：
+ 
+-如果归一化表某列为空，但 `raw/` 里有数据，说明只是字段名没命中规则，不代表没抓到。把对应 raw JSON 的一小段结构提供出来即可精确补 parser。
++- `songs.csv/json`
++- `aliases.csv/json`
++- `charts.csv/json`
++- `tag_votes.csv/json`
++- `tag_catalog.csv/json`
++- `data.json`：按歌曲聚合的完整数据
++- `manifest.json`
++- `api_attempts.json`：每次 API 尝试及 HTTP 状态
++- `raw/songlist.json`
++- `raw/tag_catalog.json`
++- `raw/top_batch/*.json`
+ 
++`charts.csv` 的 `main_label` 会按网站前端当前规则计算：主属性前两名占比差不超过 10% 时显示“综合”；最高主属性票数低于 20 时 `main_label_question=true`。
+ 
+-## v2：Cloudflare 处理
++`tag_votes.csv` 中：
+ 
+-GitHub 托管 Runner 可能会让 `https://kyou.net.cn/api/tags/tree` 返回 Cloudflare 的 `403 Just a moment...`。
++- `tag_type=primary`：五个真实主属性（读谱、硬抗、拆谱、定位、多指）的汇总票数；
++- `tag_type=secondary`：细标签票数；
++- “综合”不是后端标签节点，而是前端根据主属性票数推导出的显示标签，所以放在 `charts.main_label`，不会伪造为一条投票。
+ 
+-v2 会先把该 API 作为顶层页面打开，让浏览器有机会执行 Cloudflare 的浏览器挑战；通过后再进入 `/songs`。GitHub Actions 使用 `xvfb-run + --headful` 运行真实有界面 Chromium。
++## 本地运行
+ 
+-如果 Cloudflare 仍拒绝 GitHub 的机房 IP，任务会明确失败（不会再出现“绿了但 0 条数据”），同时 `if: always()` 保留完整 Artifact 供诊断。
+-
+-运行结果新增：
+-
+-- `cloudflare.json`：挑战通过情况、状态码、是否获得 `cf_clearance`
+-- `cloudflare.html`：挑战最后页面
+-- `manifest.json.page_load_failed`：曲目页是否仍加载失败
+-
+-如果 v2 仍持续返回 Cloudflare 403，说明站点策略直接拒绝 GitHub 托管 Runner 的出口 IP。此时最稳定的做法是换 GitHub self-hosted runner（你的电脑/家里小主机）或其他允许访问该站点的固定运行环境，而不是继续堆解析规则。
++```powershell
++py -m venv .venv; .\.venv\Scripts\Activate.ps1; py -m pip install -r .\requirements.txt; py -m playwright install chromium; py .\crawler.py --headful --out output
++```
+ 
+-## v3 诊断/直连模式
++## GitHub Actions
+ 
+-v3 针对 GitHub Hosted Runner 上出现的特殊情况：`/api/tags/tree` 作为顶层页面访问能返回 200 JSON，但 `/songs` 内部的 `fetch` 仍可能加载失败。
++定时任务默认只使用批量接口，避免在批量接口失败时自动产生数千次逐谱请求。
+ 
+-新增输出：
++如果需要人工验证逐谱 GET 备用方案，在 Actions 的 **Run workflow** 中勾选 `tree_fallback`。这会显著增加请求量，不建议作为小时级定时策略。
+ 
+-- `tag_catalog.json`：标签目录（不会再误记为谱面投票）
+-- `api_traffic.json`：所有同源 `/api/*` 请求的状态码/类型/响应前缀
+-- `scripts/`：页面实际加载的同源 JS bundle
+-- `frontend_api_strings.json`：从 JS bundle 中静态提取的 `/api/...` 字符串及上下文
+-- `api_probes.json`：对发现的安全只读 API 进行顶层 GET 导航探测的结果
+-- `browser_events.json`：console/pageerror/requestfailed 诊断
++## 完整性
+ 
+-只读 API 探测会跳过名称中包含登录、用户、投票、评论、更新、删除、上传等明显有副作用的接口。
++只有歌曲、谱面和标签数据完整时脚本才返回 0。失败时 Actions 会变红，但 `if: always()` 仍会上传诊断 Artifact，便于继续定位。
+diff --git a/crawler.py b/crawler.py
+index 34d636c..640729d 100644
+--- a/crawler.py
++++ b/crawler.py
+@@ -3,1078 +3,717 @@ from __future__ import annotations
+ import argparse
+ import asyncio
+ import csv
+-import hashlib
+ import json
+-import re
++import random
+ import sys
+ import time
+-from dataclasses import dataclass, asdict
+ from pathlib import Path
+ from typing import Any
+-from urllib.parse import urlparse, urljoin
++from urllib.parse import urlencode
+ 
+-from playwright.async_api import async_playwright, Page, Response
++from playwright.async_api import async_playwright, Browser
+ 
+-BASE_URL = "https://kyou.net.cn/songs"
+-CF_PROBE_URL = "https://kyou.net.cn/api/tags/tree"
+ SITE_ORIGIN = "https://kyou.net.cn"
++SONGLIST_PATH = "/api/songs/songlist"
++TAG_TREE_PATH = "/api/tags/tree"
++TOP_BATCH_PATH = "/api/tags/top-batch"
++STANDARD_DIFFS = ["ez", "hd", "in", "at"]
+ 
+-PRIMARY_TAGS = {"综合", "读谱", "硬抗", "拆谱", "定位", "多指"}
+-SECONDARY_TAGS = {
+-    "差速", "脑裂", "多面下落", "变速/闪现", "变速", "闪现", "面海", "扫线",
+-    "长条藏键", "慢流速", "非线性下落", "判定线干扰", "复杂节奏",
+-    "长纵连", "长连点/交互", "长连点", "交互", "快交互", "双押海", "宽排键", "连点爆发",
+-    "全换", "反手", "锁手", "锚键", "刹车", "频繁切轨", "倒打", "蓝夹黄", "蓝夹红",
+-    "浮现式", "叠", "乱", "切", "楼梯", "3k", "4k", "5k", "6k", "拍砖", "对拍", "对切",
+-}
+-ALL_KNOWN_TAGS = PRIMARY_TAGS | SECONDARY_TAGS
+-
+-NAME_KEYS = {
+-    "name", "title", "song", "songname", "song_name", "music", "musicname", "music_name",
+-    "track", "trackname", "track_name", "曲名", "歌曲名",
+-}
+-SONG_ID_KEYS = {"songid", "song_id", "musicid", "music_id", "trackid", "track_id"}
+-CHART_ID_KEYS = {"chartid", "chart_id", "scoreid", "score_id", "谱面id"}
+-DIFF_KEYS = {"difficulty", "diff", "difficultyname", "difficulty_name", "rank", "谱面难度", "难度"}
+-CONST_KEYS = {"constant", "const", "rating", "level", "difficultyvalue", "difficulty_value", "定数"}
+-ALIAS_HINTS = ("alias", "aka", "nickname", "nick", "othername", "other_name", "别名", "俗称")
+-TAG_HINTS = ("tag", "label", "标签", "属性", "feature")
+-VOTE_HINTS = ("vote", "votes", "votecount", "vote_count", "count", "score", "like", "赞", "票")
+-PRIMARY_HINTS = ("primary", "main", "major", "主标签", "主属性", "主")
+-SECONDARY_HINTS = ("secondary", "sub", "minor", "detail", "次标签", "副标签", "次")
+-
+-UI_EXCLUDE = {
+-    "刷新", "清空所有缓存", "标签展示的机制", "搜索", "筛选", "排序",
+-    "综合", "读谱", "硬抗", "拆谱", "定位", "多指",
+-    "EZ", "HD", "IN", "AT", "Legacy", "SP", "?", "×", "关闭",
+-}
+-
+-def norm_key(key: Any) -> str:
+-    return re.sub(r"[^a-z0-9_\u4e00-\u9fff]", "", str(key).lower())
+-
+-def safe_json(obj: Any) -> str:
+-    return json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
+-
+-def sha(obj: Any) -> str:
+-    return hashlib.sha256(safe_json(obj).encode("utf-8")).hexdigest()
+-
+-def scalar(v: Any) -> bool:
+-    return isinstance(v, (str, int, float, bool)) or v is None
+-
+-def as_text(v: Any) -> str:
+-    if v is None:
+-        return ""
+-    if isinstance(v, str):
+-        return v.strip()
+-    if isinstance(v, (int, float, bool)):
+-        return str(v)
+-    return ""
+-
+-def pick(d: dict, keys: set[str]) -> Any:
+-    for k, v in d.items():
+-        if norm_key(k) in keys and scalar(v):
+-            return v
+-    return None
+-
+-def first_name(d: dict) -> str:
+-    for k, v in d.items():
+-        nk = norm_key(k)
+-        if nk in NAME_KEYS and isinstance(v, str) and 1 <= len(v.strip()) <= 200:
+-            return v.strip()
+-    return ""
+-
+-def extract_alias_values(v: Any) -> list[str]:
+-    out: list[str] = []
+-    if isinstance(v, str):
+-        # Preserve aliases containing commas when possible, but split obvious lists.
+-        parts = re.split(r"[\n、;；|]+", v)
+-        out += [x.strip() for x in parts if x.strip()]
+-    elif isinstance(v, list):
+-        for x in v:
+-            if isinstance(x, str):
+-                if x.strip():
+-                    out.append(x.strip())
+-            elif isinstance(x, dict):
+-                n = first_name(x)
+-                if n:
+-                    out.append(n)
+-                else:
+-                    for kk in ("alias", "nickname", "name", "title", "text", "value"):
+-                        if kk in x and isinstance(x[kk], str) and x[kk].strip():
+-                            out.append(x[kk].strip())
+-                            break
+-    elif isinstance(v, dict):
+-        for x in v.values():
+-            if isinstance(x, str) and x.strip():
+-                out.append(x.strip())
+-    return list(dict.fromkeys(out))
+-
+-def vote_number(d: dict) -> int | float | None:
+-    preferred = []
+-    fallback = []
+-    for k, v in d.items():
+-        nk = norm_key(k)
+-        if isinstance(v, bool) or not isinstance(v, (int, float)):
+-            continue
+-        if any(h in nk for h in VOTE_HINTS):
+-            preferred.append(v)
+-        elif nk in {"value", "num", "number"}:
+-            fallback.append(v)
+-    if preferred:
+-        return preferred[0]
+-    if fallback:
+-        return fallback[0]
+-    return None
+-
+-def tag_name_from_obj(d: dict) -> str:
+-    for k, v in d.items():
+-        nk = norm_key(k)
+-        if isinstance(v, str) and (
+-            nk in {"tag", "tagname", "tag_name", "label", "labelname", "label_name", "text", "name", "title", "标签"}
+-            or any(h in nk for h in TAG_HINTS)
+-        ):
+-            s = v.strip()
+-            if 0 < len(s) <= 60:
+-                return s
+-    return ""
+-
+-def infer_tag_type(tag: str, path: str, d: dict | None = None) -> str:
+-    if tag in PRIMARY_TAGS:
+-        return "primary"
+-    if tag in SECONDARY_TAGS:
+-        return "secondary"
+-    low = norm_key(path)
+-    if any(norm_key(h) in low for h in SECONDARY_HINTS):
+-        return "secondary"
+-    if any(norm_key(h) in low for h in PRIMARY_HINTS):
+-        return "primary"
+-    if d:
+-        for k, v in d.items():
+-            nk = norm_key(k)
+-            sv = str(v).lower()
+-            if "type" in nk or "category" in nk or "kind" in nk:
+-                if any(h in sv for h in ("secondary", "sub", "minor", "次", "副")):
+-                    return "secondary"
+-                if any(h in sv for h in ("primary", "main", "major", "主")):
+-                    return "primary"
+-    return "unknown"
+-
+-@dataclass(frozen=True)
+-class SongRow:
+-    song_id: str
+-    name: str
+-    source: str
+-
+-@dataclass(frozen=True)
+-class AliasRow:
+-    song_id: str
+-    song_name: str
+-    alias: str
+-    source: str
+-
+-@dataclass(frozen=True)
+-class ChartRow:
+-    chart_id: str
+-    song_id: str
+-    song_name: str
+-    difficulty: str
+-    constant: str
+-    source: str
+-
+-@dataclass(frozen=True)
+-class VoteRow:
+-    chart_id: str
+-    song_id: str
+-    song_name: str
+-    difficulty: str
+-    tag_type: str
+-    tag: str
+-    votes: str
+-    source: str
+-    path: str
+-
+-class Normalizer:
+-    def __init__(self) -> None:
+-        self.songs: set[SongRow] = set()
+-        self.aliases: set[AliasRow] = set()
+-        self.charts: set[ChartRow] = set()
+-        self.votes: set[VoteRow] = set()
+-
+-    def add_blob(self, blob: Any, source: str) -> None:
+-        self._walk(blob, source, "$", {})
+-
+-    def _walk(self, obj: Any, source: str, path: str, ctx: dict[str, str]) -> None:
+-        if isinstance(obj, dict):
+-            local = dict(ctx)
+-
+-            name = first_name(obj)
+-            sid = pick(obj, SONG_ID_KEYS)
+-            cid = pick(obj, CHART_ID_KEYS)
+-            diff = pick(obj, DIFF_KEYS)
+-            const = pick(obj, CONST_KEYS)
+-
+-            if name:
+-                # A name next to chart/difficulty info is more likely song context than a generic nested label.
+-                if sid is not None or any(norm_key(k) in DIFF_KEYS | CONST_KEYS for k in obj.keys()) or any(
+-                    any(x in norm_key(k) for x in ("chart", "difficulty", "谱面", "alias", "别名")) for k in obj.keys()
+-                ):
+-                    local["song_name"] = name
+-            if sid is not None:
+-                local["song_id"] = str(sid)
+-            if cid is not None:
+-                local["chart_id"] = str(cid)
+-            if diff is not None:
+-                local["difficulty"] = str(diff)
+-            if const is not None:
+-                local["constant"] = str(const)
+-
+-            song_name = local.get("song_name", "")
+-            song_id = local.get("song_id", "")
+-            if song_name and (song_id or any(any(h in norm_key(k) for h in ALIAS_HINTS) for k in obj.keys())):
+-                self.songs.add(SongRow(song_id, song_name, source))
+-
+-            # Aliases
+-            for k, v in obj.items():
+-                nk = norm_key(k)
+-                if any(norm_key(h) in nk for h in ALIAS_HINTS):
+-                    for alias in extract_alias_values(v):
+-                        if alias and alias != song_name:
+-                            self.aliases.add(AliasRow(song_id, song_name, alias, source))
+-
+-            # Chart
+-            if local.get("chart_id") or local.get("difficulty"):
+-                if song_name or song_id:
+-                    self.charts.add(
+-                        ChartRow(
+-                            local.get("chart_id", ""),
+-                            song_id,
+-                            song_name,
+-                            local.get("difficulty", ""),
+-                            local.get("constant", ""),
+-                            source,
+-                        )
+-                    )
+-
+-            # Tag object: {name/tag: "...", votes/count: N}
+-            tname = tag_name_from_obj(obj)
+-            if tname:
+-                vnum = vote_number(obj)
+-                looks_taggy = (
+-                    tname in ALL_KNOWN_TAGS
+-                    or any(any(h in norm_key(k) for h in TAG_HINTS) for k in obj.keys())
+-                    or any(any(h in norm_key(k) for h in VOTE_HINTS) for k in obj.keys())
+-                )
+-                # A bare tag-tree node (name + voteCount) is tag metadata, not a
+-                # chart vote. Require chart/song context before emitting VoteRow.
+-                has_chart_context = bool(
+-                    local.get("chart_id") or local.get("difficulty") or song_name or song_id
+-                )
+-                if looks_taggy and has_chart_context:
+-                    self.votes.add(
+-                        VoteRow(
+-                            local.get("chart_id", ""),
+-                            song_id,
+-                            song_name,
+-                            local.get("difficulty", ""),
+-                            infer_tag_type(tname, path, obj),
+-                            tname,
+-                            "" if vnum is None else str(vnum),
+-                            source,
+-                            path,
+-                        )
+-                    )
+-
+-            # Map-shaped votes: {"综合": 12, "定位": 8} or {"tags": {"综合": 12}}
+-            for k, v in obj.items():
+-                ks = str(k).strip()
+-                if (
+-                    ks in ALL_KNOWN_TAGS
+-                    and isinstance(v, (int, float))
+-                    and not isinstance(v, bool)
+-                    and (local.get("chart_id") or local.get("difficulty") or song_name or song_id)
+-                ):
+-                    self.votes.add(
+-                        VoteRow(
+-                            local.get("chart_id", ""),
+-                            song_id,
+-                            song_name,
+-                            local.get("difficulty", ""),
+-                            infer_tag_type(ks, path, obj),
+-                            ks,
+-                            str(v),
+-                            source,
+-                            f"{path}.{k}",
+-                        )
+-                    )
+-
+-            for k, v in obj.items():
+-                self._walk(v, source, f"{path}.{k}", local)
+-
+-        elif isinstance(obj, list):
+-            for i, v in enumerate(obj):
+-                self._walk(v, source, f"{path}[{i}]", ctx)
+-
+-class Recorder:
+-    def __init__(self, out: Path, normalizer: Normalizer) -> None:
+-        self.out = out
+-        self.normalizer = normalizer
+-        self.raw_dir = out / "raw"
+-        self.script_dir = out / "scripts"
+-        self.raw_dir.mkdir(parents=True, exist_ok=True)
+-        self.script_dir.mkdir(parents=True, exist_ok=True)
+-        self.seen_hashes: set[str] = set()
+-        self.records: list[dict[str, Any]] = []
+-        self.api_traffic: list[dict[str, Any]] = []
+-        self.api_strings: list[dict[str, Any]] = []
+-        self.api_paths: set[str] = set()
+-        self.pending: set[asyncio.Task] = set()
+-        self.script_count = 0
+-
+-    def schedule_response(self, response: Response) -> None:
+-        task = asyncio.create_task(self._handle_response(response))
+-        self.pending.add(task)
+-        task.add_done_callback(self.pending.discard)
+-
+-    async def drain(self) -> None:
+-        if self.pending:
+-            await asyncio.gather(*list(self.pending), return_exceptions=True)
+-
+-    def _extract_api_strings(self, text: str, source: str) -> None:
+-        # Front-end bundles often build URLs by concatenation, so keep both the
+-        # nearest literal-looking path and a context snippet around every /api/.
+-        for m in re.finditer(r"/api/", text):
+-            i = m.start()
+-            tail = text[i:i + 300]
+-            pm = re.match(r"/api/[A-Za-z0-9_./?=&%:+~@,-]*", tail)
+-            path = (pm.group(0) if pm else "/api/").rstrip('.,;')
+-            if len(path) > 5:
+-                self.api_paths.add(path)
+-            self.api_strings.append({
+-                "source": source,
+-                "path_guess": path,
+-                "context": text[max(0, i - 180): i + 360],
+-            })
+ 
+-    def _flatten_tag_tree(self, obj: Any) -> list[dict[str, Any]]:
+-        out: list[dict[str, Any]] = []
+-        def walk(x: Any, inherited_parent: int | None = None) -> None:
+-            if isinstance(x, list):
+-                for y in x:
+-                    walk(y, inherited_parent)
+-                return
+-            if not isinstance(x, dict):
+-                return
+-            if "id" in x and "name" in x:
+-                out.append({
+-                    "id": x.get("id"),
+-                    "name": x.get("name"),
+-                    "parentIds": x.get("parentIds", []),
+-                    "description": x.get("description"),
+-                    "sortOrder": x.get("sortOrder"),
+-                    "status": x.get("status"),
+-                })
+-            for y in x.get("children", []) if isinstance(x.get("children"), list) else []:
+-                walk(y, x.get("id"))
+-        walk(obj)
+-        # same secondary tag may appear below multiple parents; dedupe by id
+-        dedup: dict[str, dict[str, Any]] = {}
+-        for row in out:
+-            dedup[str(row.get("id"))] = row
+-        return list(dedup.values())
+-
+-    async def _handle_response(self, response: Response) -> None:
+-        try:
+-            req = response.request
+-            rt = req.resource_type
+-            ct = (response.headers.get("content-type") or "").lower()
+-            same_origin_api = response.url.startswith(SITE_ORIGIN + "/api/")
+-
+-            # Always record same-origin API traffic, even if the response is HTML,
+-            # empty, duplicated, or otherwise not parseable. This is diagnostic truth.
+-            if same_origin_api:
+-                api_meta = {
+-                    "url": response.url,
+-                    "status": response.status,
+-                    "method": req.method,
+-                    "resource_type": rt,
+-                    "content_type": ct,
+-                    "post_data": req.post_data,
+-                }
+-                try:
+-                    txt = await response.text()
+-                    api_meta["body_prefix"] = txt[:1600]
+-                except Exception as e:
+-                    api_meta["body_error"] = repr(e)
+-                self.api_traffic.append(api_meta)
+-
+-            # Save same-origin JS bundles and statically discover API strings.
+-            if rt == "script" and response.url.startswith(SITE_ORIGIN + "/"):
+-                try:
+-                    text = await response.text()
+-                    if text and len(text) <= 12_000_000:
+-                        self.script_count += 1
+-                        name = Path(urlparse(response.url).path).name or f"script_{self.script_count}.js"
+-                        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+-                        target = self.script_dir / f"{self.script_count:03d}_{safe_name}"
+-                        target.write_text(text, encoding="utf-8")
+-                        self._extract_api_strings(text, response.url)
+-                except Exception:
+-                    pass
+-                return
+-
+-            if rt not in ("xhr", "fetch", "document"):
+-                return
+-            if not any(x in ct for x in ("json", "javascript", "text/plain", "text/html")):
+-                return
+-            text = await response.text()
+-            if not text or len(text) > 25_000_000:
+-                return
+-            parsed: Any
+-            try:
+-                parsed = json.loads(text)
+-            except Exception:
+-                if not any(x in text for x in ("综合", "读谱", "硬抗", "拆谱", "定位", "多指", "alias", "vote", "tag", "别名", "标签", "song", "chart")):
+-                    return
+-                parsed = {"_text": text}
+-
+-            h = sha(parsed)
+-            if h in self.seen_hashes:
+-                return
+-            self.seen_hashes.add(h)
+-
+-            n = len(self.records) + 1
+-            raw_path = self.raw_dir / f"response_{n:05d}.json"
+-            raw_path.write_text(json.dumps(parsed, ensure_ascii=False, indent=2), encoding="utf-8")
+-
+-            meta = {
+-                "url": response.url,
+-                "status": response.status,
+-                "method": req.method,
+-                "resource_type": rt,
+-                "content_type": ct,
+-                "post_data": req.post_data,
+-                "raw_file": str(raw_path.relative_to(self.out)),
+-                "sha256": h,
+-            }
+-            self.records.append(meta)
+-
+-            if response.url.split("?", 1)[0] == CF_PROBE_URL and isinstance(parsed, list):
+-                catalog = self._flatten_tag_tree(parsed)
+-                (self.out / "tag_catalog.json").write_text(
+-                    json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8"
+-                )
++def write_json(path: Path, obj: Any) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+ 
+-            self.normalizer.add_blob(parsed, response.url)
+-        except Exception:
+-            return
+ 
+-    def write_diagnostics(self) -> None:
+-        (self.out / "api_traffic.json").write_text(
+-            json.dumps(self.api_traffic, ensure_ascii=False, indent=2), encoding="utf-8"
+-        )
+-        # Dedupe huge minified-bundle repeats by (source,path,context).
+-        seen: set[str] = set()
+-        rows: list[dict[str, Any]] = []
+-        for row in self.api_strings:
+-            k = sha(row)
+-            if k in seen:
+-                continue
+-            seen.add(k)
+-            rows.append(row)
+-        (self.out / "frontend_api_strings.json").write_text(
+-            json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
+-        )
++def write_csv(path: Path, rows: list[dict[str, Any]], fields: list[str] | None = None) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    if fields is None:
++        fields = list(rows[0].keys()) if rows else []
++    if not fields:
++        path.write_text("", encoding="utf-8-sig")
++        return
++    with path.open("w", newline="", encoding="utf-8-sig") as f:
++        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
++        w.writeheader()
++        w.writerows(rows)
+ 
+ 
+-async def warm_up_cloudflare(page: Page, out: Path, timeout_ms: int = 45000) -> dict[str, Any]:
+-    """Navigate to a protected API endpoint so Cloudflare can run its browser challenge.
++def chunks(items: list[str], size: int):
++    for i in range(0, len(items), size):
++        yield i // size, items[i:i + size]
+ 
+-    fetch/XHR challenges return HTML to JavaScript and are never executed. A top-level
+-    navigation gives Cloudflare a real page where its challenge script can run and, on
+-    success, set the clearance cookie for subsequent API requests.
+-    """
+-    result: dict[str, Any] = {
+-        "url": CF_PROBE_URL,
+-        "attempted": True,
+-        "passed": False,
+-        "status": None,
+-        "content_type": "",
+-        "final_url": "",
+-        "title": "",
+-        "body_prefix": "",
+-        "clearance_cookie": False,
+-    }
+ 
++def nonzero_number(v: Any) -> bool:
++    if v is None or v == "":
++        return False
+     try:
+-        response = await page.goto(CF_PROBE_URL, wait_until="domcontentloaded", timeout=90000)
+-        if response is not None:
+-            result["status"] = response.status
+-            result["content_type"] = (response.headers.get("content-type") or "").lower()
+-
+-        deadline = time.monotonic() + timeout_ms / 1000
+-        while time.monotonic() < deadline:
+-            await page.wait_for_timeout(1000)
+-            try:
+-                title = await page.title()
+-                body = (await page.locator("body").inner_text())[:4000]
+-            except Exception:
+-                title, body = "", ""
+-
+-            cookies = await page.context.cookies()
+-            has_clearance = any(c.get("name") == "cf_clearance" for c in cookies)
+-            challenge = (
+-                "Just a moment" in title
+-                or "Enable JavaScript and cookies to continue" in body
+-                or "cf-chl" in (await page.content())[:12000]
+-            )
++        return float(v) != 0
++    except (TypeError, ValueError):
++        return False
+ 
+-            result.update({
+-                "final_url": page.url,
+-                "title": title,
+-                "body_prefix": body[:1000],
+-                "clearance_cookie": has_clearance,
+-            })
+ 
+-            # The API JSON may be rendered as plain text in the browser. Any non-challenge
+-            # page after the direct navigation is enough to retry the app.
+-            if not challenge:
+-                result["passed"] = True
+-                break
++def aliases_from(value: Any) -> list[str]:
++    if isinstance(value, list):
++        return list(dict.fromkeys(str(x).strip() for x in value if str(x).strip()))
++    if isinstance(value, str) and value.strip():
++        # The live site normally uses an array. This is only a compatibility fallback.
++        return [x.strip() for x in value.replace("；", ";").split(";") if x.strip()]
++    return []
+ 
+-        (out / "cloudflare.json").write_text(
+-            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+-        )
+-        try:
+-            (out / "cloudflare.html").write_text(await page.content(), encoding="utf-8")
+-        except Exception:
+-            pass
+-        return result
+-    except Exception as e:
+-        result["error"] = repr(e)
+-        (out / "cloudflare.json").write_text(
+-            json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8"
+-        )
+-        return result
+-
+-
+-async def wait_for_song_page(page: Page, retries: int = 3) -> str:
+-    """Wait for the song page; retry its own retry button when API startup races."""
+-    last_body = ""
+-    for attempt in range(retries + 1):
++
++def root_catalog(tag_tree: list[dict[str, Any]]) -> tuple[dict[int, str], dict[int, dict[str, Any]]]:
++    roots: dict[int, str] = {}
++    all_tags: dict[int, dict[str, Any]] = {}
++    for root in tag_tree:
+         try:
+-            await page.wait_for_timeout(1500 if attempt == 0 else 1000)
+-            last_body = await page.locator("body").inner_text()
++            rid = int(root.get("id"))
+         except Exception:
+-            last_body = ""
+-
+-        if "无法加载曲目列表" not in last_body and "加载失败" not in last_body:
+-            return last_body
+-
+-        if attempt < retries:
++            continue
++        roots[rid] = str(root.get("name") or rid)
++        all_tags[rid] = root
++        for child in root.get("children") or []:
+             try:
+-                retry = page.get_by_text("重试", exact=True)
+-                if await retry.count():
+-                    await retry.first.click(timeout=3000)
+-                    await page.wait_for_timeout(2000)
+-                    continue
++                cid = int(child.get("id"))
+             except Exception:
+-                pass
+-            await page.reload(wait_until="domcontentloaded", timeout=90000)
++                continue
++            all_tags[cid] = child
++    return roots, all_tags
++
++
++def flatten_catalog(tag_tree: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    rows: list[dict[str, Any]] = []
++    seen: set[tuple[int, str]] = set()
++    for root in tag_tree:
++        rid = root.get("id")
++        rows.append({
++            "tag_id": rid,
++            "tag": root.get("name", ""),
++            "tag_type": "primary",
++            "parent_ids": "",
++            "description": root.get("description") or "",
++        })
++        for child in root.get("children") or []:
++            cid = child.get("id")
++            key = (cid, str(child.get("name") or ""))
++            if key in seen:
++                continue
++            seen.add(key)
++            pids = child.get("parentIds") or [rid]
++            rows.append({
++                "tag_id": cid,
++                "tag": child.get("name", ""),
++                "tag_type": "secondary",
++                "parent_ids": "|".join(str(x) for x in pids),
++                "description": child.get("description") or "",
++            })
++    return rows
+ 
+-    return last_body
+ 
+-def _safe_probe_path(raw: str) -> str | None:
+-    path = raw.strip().strip('"\'` ')
+-    if not path.startswith("/api/"):
+-        return None
+-    # Dynamic placeholders need concrete IDs/params and are not useful as-is.
+-    if any(x in path for x in ("${", "{", "}", "[", "]", "<", ">")):
+-        return None
+-    # Never probe mutation/auth/account endpoints, even with GET.
+-    low = path.lower()
+-    blocked = (
+-        "login", "logout", "register", "password", "delete", "remove", "create",
+-        "update", "upload", "admin", "vote", "comment", "like", "favorite",
+-        "auth", "send", "report", "user/", "profile",
+-    )
+-    if any(x in low for x in blocked):
+-        return None
+-    # Trim obvious minifier punctuation accidentally captured at the end.
+-    path = path.rstrip("),;:.+-")
+-    return path if len(path) > 5 else None
+-
+-
+-async def probe_discovered_apis(
+-    page: Page,
+-    out: Path,
+-    recorder: Recorder,
+-    normalizer: Normalizer,
+-    limit: int = 80,
+-) -> list[dict[str, Any]]:
+-    """Probe statically discovered same-origin APIs using top-level GET navigation.
+-
+-    On this site Cloudflare has been observed to treat fetch/XHR and top-level
+-    document navigation differently. We deliberately only use safe GET navigation
+-    and skip endpoints whose names suggest mutations/auth/user actions.
++class IsolatedBrowserClient:
++    """Make API calls from a fresh browser context.
++
++    The site currently lets a clean Chromium context's first top-level request
++    through Cloudflare more reliably than requests made after /songs has loaded.
++    GET therefore uses direct document navigation. POST uses a locally-fulfilled
++    same-origin bootstrap page, so the POST is the first real network request.
+     """
+-    await recorder.drain()
+-    candidates: list[str] = []
+-    seen: set[str] = set()
+-    for raw in sorted(recorder.api_paths):
+-        pth = _safe_probe_path(raw)
+-        if not pth or pth in seen:
+-            continue
+-        seen.add(pth)
+-        candidates.append(pth)
+-
+-    # A few known read-only endpoints are useful even if bundle extraction misses
+-    # them because of string concatenation/minification.
+-    for pth in ("/api/tags/tree",):
+-        if pth not in seen:
+-            candidates.append(pth)
+-            seen.add(pth)
+-
+-    results: list[dict[str, Any]] = []
+-    probe_page = await page.context.new_page()
+-    probe_page.on("response", recorder.schedule_response)
+-    try:
+-        for pth in candidates[:limit]:
+-            url = urljoin(SITE_ORIGIN, pth)
+-            row: dict[str, Any] = {"path": pth, "url": url}
++
++    def __init__(self, browser: Browser, out: Path, retries: int, timeout_ms: int, pause_ms: int):
++        self.browser = browser
++        self.out = out
++        self.retries = retries
++        self.timeout_ms = timeout_ms
++        self.pause_ms = pause_ms
++        self.attempts: list[dict[str, Any]] = []
++
++    async def _pause(self, attempt: int = 0) -> None:
++        ms = self.pause_ms + attempt * 700 + random.randint(0, 350)
++        await asyncio.sleep(ms / 1000)
++
++    def _record(self, **item: Any) -> None:
++        self.attempts.append(item)
++        write_json(self.out / "api_attempts.json", self.attempts)
++
++    async def get_json(self, path: str, purpose: str, retries: int | None = None) -> Any | None:
++        tries = retries if retries is not None else self.retries
++        url = path if path.startswith("http") else SITE_ORIGIN + path
++        for attempt in range(tries):
++            context = await self.browser.new_context(locale="zh-CN")
++            page = await context.new_page()
++            started = time.time()
++            status = None
++            ct = ""
++            body = ""
++            error = ""
+             try:
+-                resp = await probe_page.goto(url, wait_until="domcontentloaded", timeout=30000)
+-                if resp is not None:
+-                    row["status"] = resp.status
+-                    row["content_type"] = (resp.headers.get("content-type") or "").lower()
+-                text = (await probe_page.locator("body").inner_text())[:2_000_000]
+-                row["body_prefix"] = text[:1200]
+-                try:
+-                    data = json.loads(text)
+-                    row["json"] = True
+-                    row["json_type"] = type(data).__name__
+-                    if isinstance(data, list):
+-                        row["json_items"] = len(data)
+-                    elif isinstance(data, dict):
+-                        row["json_keys"] = list(data.keys())[:40]
+-                    normalizer.add_blob(data, url + "#top-level-probe")
+-                except Exception:
+-                    row["json"] = False
++                response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
++                status = response.status if response else None
++                ct = (response.headers.get("content-type") or "") if response else ""
++                body = await page.locator("body").inner_text(timeout=5000)
++                parsed = json.loads(body) if body.strip() else None
++                ok = status is not None and 200 <= status < 300
++                self._record(
++                    purpose=purpose, method="GET", strategy="fresh_document",
++                    url=url, attempt=attempt + 1, status=status, content_type=ct,
++                    ok=ok, elapsed_ms=int((time.time() - started) * 1000),
++                    body_prefix=body[:500],
++                )
++                if ok:
++                    return parsed
+             except Exception as e:
+-                row["error"] = repr(e)
+-            results.append(row)
+-    finally:
+-        await recorder.drain()
+-        await probe_page.close()
+-
+-    (out / "api_probes.json").write_text(
+-        json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
+-    )
+-    return results
+-
+-
+-async def dump_web_storage(page: Page, out: Path, normalizer: Normalizer) -> None:
+-    storage = await page.evaluate("""() => {
+-      const read = (s) => {
+-        const o = {};
+-        for (let i = 0; i < s.length; i++) {
+-          const k = s.key(i);
+-          o[k] = s.getItem(k);
+-        }
+-        return o;
+-      };
+-      return {localStorage: read(localStorage), sessionStorage: read(sessionStorage)};
+-    }""")
+-    (out / "web_storage.json").write_text(json.dumps(storage, ensure_ascii=False, indent=2), encoding="utf-8")
+-
+-    for group_name, group in storage.items():
+-        for k, v in group.items():
+-            if not isinstance(v, str):
++                error = repr(e)
++                self._record(
++                    purpose=purpose, method="GET", strategy="fresh_document",
++                    url=url, attempt=attempt + 1, status=status, content_type=ct,
++                    ok=False, elapsed_ms=int((time.time() - started) * 1000),
++                    body_prefix=body[:500], error=error,
++                )
++            finally:
++                await context.close()
++            await self._pause(attempt)
++        return None
++
++    async def post_json(self, path: str, payload: dict[str, Any], purpose: str, retries: int | None = None) -> Any | None:
++        tries = retries if retries is not None else self.retries
++        url = path if path.startswith("http") else SITE_ORIGIN + path
++        bootstrap = SITE_ORIGIN + "/__kyou_crawler_bootstrap__"
++
++        for attempt in range(tries):
++            # Strategy A: turn a top-level navigation into POST via request
++            # interception. This keeps Sec-Fetch-Dest=document, which matters
++            # because Cloudflare currently treats document and fetch requests
++            # differently on this site.
++            context = await self.browser.new_context(locale="zh-CN")
++            page = await context.new_page()
++            started = time.time()
++            status = None
++            body = ""
++            ct = ""
++
++            async def rewrite_as_post(route):
++                headers = dict(route.request.headers)
++                headers.pop("content-length", None)
++                headers["content-type"] = "application/json"
++                headers["accept"] = "application/json,text/plain,*/*"
++                await route.continue_(
++                    method="POST",
++                    headers=headers,
++                    post_data=json.dumps(payload, ensure_ascii=False),
++                )
++
++            try:
++                await page.route(url, rewrite_as_post)
++                response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
++                status = response.status if response else None
++                ct = (response.headers.get("content-type") or "") if response else ""
++                body = await page.locator("body").inner_text(timeout=5000)
++                ok = status is not None and 200 <= status < 300
++                self._record(
++                    purpose=purpose, method="POST", strategy="fresh_document_post_override",
++                    url=url, attempt=attempt + 1, status=status, content_type=ct,
++                    ok=ok, elapsed_ms=int((time.time() - started) * 1000),
++                    request_summary={
++                        "difficulty": payload.get("difficulty"),
++                        "song_count": len(payload.get("songIds") or []),
++                        "limitPerSong": payload.get("limitPerSong"),
++                    },
++                    body_prefix=body[:500],
++                )
++                if ok:
++                    return json.loads(body) if body.strip() else None
++            except Exception as e:
++                self._record(
++                    purpose=purpose, method="POST", strategy="fresh_document_post_override",
++                    url=url, attempt=attempt + 1, status=status, content_type=ct,
++                    ok=False, elapsed_ms=int((time.time() - started) * 1000),
++                    request_summary={
++                        "difficulty": payload.get("difficulty"),
++                        "song_count": len(payload.get("songIds") or []),
++                    },
++                    error=repr(e), body_prefix=body[:500],
++                )
++            finally:
++                await context.close()
++
++            await self._pause(attempt)
++
++            # Strategy B: same-origin bootstrap fulfilled locally, making this
++            # POST fetch the first real network request in another clean context.
++            context = await self.browser.new_context(locale="zh-CN")
++            page = await context.new_page()
++
++            async def local_bootstrap(route):
++                await route.fulfill(
++                    status=200,
++                    content_type="text/html; charset=utf-8",
++                    body="<!doctype html><meta charset=utf-8><title>bootstrap</title>",
++                )
++
++            await page.route(bootstrap, local_bootstrap)
++            started = time.time()
++            result: dict[str, Any] = {}
++            try:
++                await page.goto(bootstrap, wait_until="domcontentloaded", timeout=10000)
++                result = await page.evaluate(
++                    """async ({url, payload}) => {
++                      try {
++                        const r = await fetch(url, {
++                          method: 'POST',
++                          headers: {'Content-Type':'application/json','Accept':'application/json'},
++                          body: JSON.stringify(payload),
++                          credentials: 'include',
++                          cache: 'no-store'
++                        });
++                        return {
++                          status: r.status,
++                          contentType: r.headers.get('content-type') || '',
++                          text: await r.text()
++                        };
++                      } catch (e) {
++                        return {status: 0, contentType: '', text: '', error: String(e)};
++                      }
++                    }""",
++                    {"url": url, "payload": payload},
++                )
++                status = int(result.get("status") or 0)
++                body = result.get("text") or ""
++                ct = result.get("contentType") or ""
++                ok = 200 <= status < 300
++                self._record(
++                    purpose=purpose, method="POST", strategy="fresh_context_first_fetch",
++                    url=url, attempt=attempt + 1, status=status, content_type=ct,
++                    ok=ok, elapsed_ms=int((time.time() - started) * 1000),
++                    request_summary={
++                        "difficulty": payload.get("difficulty"),
++                        "song_count": len(payload.get("songIds") or []),
++                        "limitPerSong": payload.get("limitPerSong"),
++                    },
++                    body_prefix=body[:500], error=result.get("error") or "",
++                )
++                if ok:
++                    return json.loads(body) if body.strip() else None
++            except Exception as e:
++                self._record(
++                    purpose=purpose, method="POST", strategy="fresh_context_first_fetch",
++                    url=url, attempt=attempt + 1, status=result.get("status"),
++                    ok=False, elapsed_ms=int((time.time() - started) * 1000),
++                    request_summary={
++                        "difficulty": payload.get("difficulty"),
++                        "song_count": len(payload.get("songIds") or []),
++                    }, error=repr(e), body_prefix=(result.get("text") or "")[:500],
++                )
++            finally:
++                await context.close()
++
++            await self._pause(attempt)
++        return None
++
++
++
++class Dataset:
++    def __init__(self, tag_tree: list[dict[str, Any]], songlist_payload: Any):
++        self.tag_tree = tag_tree
++        self.root_names, self.all_tags = root_catalog(tag_tree)
++        self.songlist_payload = songlist_payload
++        self.song_items = songlist_payload if isinstance(songlist_payload, list) else (songlist_payload or {}).get("data") or []
++        self.songs: list[dict[str, Any]] = []
++        self.aliases: list[dict[str, Any]] = []
++        self.charts: list[dict[str, Any]] = []
++        self.chart_map: dict[tuple[str, str], dict[str, Any]] = {}
++        self.votes: list[dict[str, Any]] = []
++        self._vote_keys: set[tuple[str, str, str, str]] = set()
++        self._parse_songlist()
++
++    def _parse_songlist(self) -> None:
++        seen_songs: set[str] = set()
++        for song in self.song_items:
++            if not isinstance(song, dict):
++                continue
++            sid = str(song.get("id") or song.get("songId") or "").strip()
++            if not sid:
+                 continue
++            name = str(song.get("标题") or song.get("title") or song.get("name") or "").strip()
++            aliases = aliases_from(song.get("别称") if "别称" in song else song.get("aliases"))
++            if sid not in seen_songs:
++                self.songs.append({
++                    "song_id": sid,
++                    "name": name,
++                    "pack": str(song.get("曲包") or song.get("pack") or ""),
++                })
++                seen_songs.add(sid)
++            for alias in aliases:
++                self.aliases.append({"song_id": sid, "song_name": name, "alias": alias})
++
++            diff_obj = song.get("难度") if isinstance(song.get("难度"), dict) else song.get("difficulty")
++            if not isinstance(diff_obj, dict):
++                continue
++            keys = [d for d in STANDARD_DIFFS if d in diff_obj]
++            keys += [str(d) for d in diff_obj.keys() if str(d) not in keys]
++            for diff in keys:
++                constant = diff_obj.get(diff)
++                if not nonzero_number(constant):
++                    continue
++                chart_id = f"{sid}::{str(diff).lower()}"
++                row = {
++                    "chart_id": chart_id,
++                    "song_id": sid,
++                    "song_name": name,
++                    "difficulty": str(diff).lower(),
++                    "constant": constant,
++                    "main_label": "",
++                    "main_label_question": False,
++                    "main_top_votes": 0,
++                    "main_second_votes": 0,
++                    "tag_source": "",
++                }
++                self.charts.append(row)
++                self.chart_map[(sid, str(diff).lower())] = row
++
++    def song_ids_for_diff(self, diff: str) -> list[str]:
++        return [r["song_id"] for r in self.charts if r["difficulty"] == diff]
++
++    def add_vote(self, sid: str, diff: str, tag_type: str, tag_id: Any, tag: str, votes: Any,
++                 parent_ids: list[Any] | None, source: str) -> None:
++        chart = self.chart_map.get((str(sid), str(diff).lower()))
++        if not chart:
++            return
++        key = (chart["chart_id"], tag_type, str(tag_id), source)
++        if key in self._vote_keys:
++            return
++        self._vote_keys.add(key)
++        self.votes.append({
++            "chart_id": chart["chart_id"],
++            "song_id": chart["song_id"],
++            "song_name": chart["song_name"],
++            "difficulty": chart["difficulty"],
++            "tag_type": tag_type,
++            "tag_id": tag_id,
++            "tag": tag,
++            "votes": int(votes or 0),
++            "parent_ids": "|".join(str(x) for x in (parent_ids or [])),
++            "source": source,
++        })
++
++    def apply_chart_votes(self, sid: str, diff: str, secondary: list[dict[str, Any]],
++                          parent_totals: dict[Any, Any], source: str) -> None:
++        sid = str(sid)
++        diff = str(diff).lower()
++        chart = self.chart_map.get((sid, diff))
++        if not chart:
++            return
++
++        # Main tags are the five real root categories. “综合” is derived by the
++        # front end from the leading two parent totals, not a separate root tag.
++        normalized_totals: dict[int, int] = {}
++        for rid in self.root_names:
++            raw = parent_totals.get(str(rid), parent_totals.get(rid, 0)) if isinstance(parent_totals, dict) else 0
+             try:
+-                obj = json.loads(v)
++                normalized_totals[rid] = int(raw or 0)
+             except Exception:
++                normalized_totals[rid] = 0
++            self.add_vote(sid, diff, "primary", rid, self.root_names[rid], normalized_totals[rid], [], source)
++
++        for item in secondary or []:
++            if not isinstance(item, dict):
+                 continue
+-            normalizer.add_blob(obj, f"{group_name}:{k}")
+-
+-async def dump_indexeddb(page: Page, out: Path, normalizer: Normalizer) -> None:
+-    data = await page.evaluate("""async () => {
+-      if (!indexedDB.databases) return {error: "indexedDB.databases() unavailable", databases: []};
+-      const dbs = await indexedDB.databases();
+-      const result = [];
+-      for (const info of dbs) {
+-        if (!info.name) continue;
+-        const opened = await new Promise((resolve) => {
+-          const req = indexedDB.open(info.name);
+-          req.onsuccess = () => resolve(req.result);
+-          req.onerror = () => resolve(null);
+-        });
+-        if (!opened) continue;
+-        const stores = {};
+-        for (const storeName of Array.from(opened.objectStoreNames)) {
+-          try {
+-            const rows = await new Promise((resolve) => {
+-              const tx = opened.transaction(storeName, "readonly");
+-              const req = tx.objectStore(storeName).getAll();
+-              req.onsuccess = () => resolve(req.result);
+-              req.onerror = () => resolve([]);
+-            });
+-            stores[storeName] = rows;
+-          } catch (e) {
+-            stores[storeName] = {error: String(e)};
+-          }
+-        }
+-        opened.close();
+-        result.push({name: info.name, version: info.version, stores});
+-      }
+-      return {databases: result};
+-    }""")
+-    (out / "indexeddb.json").write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+-    normalizer.add_blob(data, "indexedDB")
+-
+-async def auto_scroll(page: Page) -> None:
+-    stable = 0
+-    prev = -1
+-    for _ in range(120):
+-        h = await page.evaluate("document.documentElement.scrollHeight")
+-        await page.evaluate("window.scrollTo(0, document.documentElement.scrollHeight)")
+-        await page.wait_for_timeout(250)
+-        nh = await page.evaluate("document.documentElement.scrollHeight")
+-        if nh == prev == h:
+-            stable += 1
+-        else:
+-            stable = 0
+-        prev = nh
+-        if stable >= 5:
+-            break
+-    await page.evaluate("window.scrollTo(0, 0)")
+-
+-async def candidate_clickables(page: Page, limit: int) -> list[dict[str, Any]]:
+-    return await page.evaluate(
+-        """(limit) => {
+-          const mainTags = new Set(["综合","读谱","硬抗","拆谱","定位","多指"]);
+-          const exclude = new Set(["刷新","清空所有缓存","标签展示的机制","搜索","筛选","排序","综合","读谱","硬抗","拆谱","定位","多指","?","×","关闭"]);
+-          const els = Array.from(document.querySelectorAll('a,button,[role="button"],[tabindex],[class*="cursor-pointer"]'));
+-          const out = [];
+-          const seen = new Set();
+-          for (const el of els) {
+-            const r = el.getBoundingClientRect();
+-            if (r.width < 20 || r.height < 16) continue;
+-            const text = (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim();
+-            if (!text || text.length > 180 || exclude.has(text)) continue;
+-            const hasImg = !!el.querySelector('img,picture,[style*="background-image"]');
+-            const hasTag = Array.from(mainTags).some(x => text.includes(x));
+-            const cls = typeof el.className === 'string' ? el.className : '';
+-            let score = 0;
+-            if (hasImg) score += 5;
+-            if (hasTag) score += 4;
+-            if (cls.includes('cursor-pointer')) score += 2;
+-            if (el.tagName === 'A') score += 1;
+-            if (/\\b(EZ|HD|IN|AT|SP|Legacy)\\b/i.test(text)) score += 2;
+-            if (text.length >= 3 && text.length <= 80) score += 1;
+-            if (score < 3) continue;
+-            const key = text.slice(0,120);
+-            if (seen.has(key)) continue;
+-            seen.add(key);
+-            out.push({text:key, tag:el.tagName, cls, score});
+-          }
+-          out.sort((a,b) => b.score-a.score);
+-          return out.slice(0, limit);
+-        }""",
+-        limit,
+-    )
+-
+-async def click_explore(page: Page, out: Path, max_clicks: int, delay_ms: int) -> int:
+-    # Scan viewport-by-viewport instead of once. This also works when the song list is virtualized.
+-    clicked = 0
+-    seen_texts: set[str] = set()
+-    all_candidates: list[dict[str, Any]] = []
+-    details_file = (out / "detail_snapshots.ndjson").open("w", encoding="utf-8")
++            tid = item.get("tagId", item.get("id"))
++            tag = str(item.get("tagName") or item.get("name") or self.all_tags.get(int(tid), {}).get("name") if tid is not None else "")
++            parents = item.get("parentIds") or (self.all_tags.get(int(tid), {}).get("parentIds") if tid is not None and str(tid).isdigit() else []) or []
++            self.add_vote(sid, diff, "secondary", tid, tag, item.get("voteCount", 0), parents, source)
++
++        ranked = sorted(normalized_totals.items(), key=lambda kv: (-kv[1], list(self.root_names).index(kv[0])))
++        if ranked:
++            top_id, top = ranked[0]
++            second = ranked[1][1] if len(ranked) > 1 else 0
++            total = sum(normalized_totals.values())
++            comprehensive = bool(total > 0 and (top / total - second / total) <= 0.1)
++            chart["main_label"] = "综合" if comprehensive else (self.root_names.get(top_id, "") if top > 0 else "")
++            chart["main_label_question"] = bool(top > 0 and top < 20)
++            chart["main_top_votes"] = top
++            chart["main_second_votes"] = second
++            chart["tag_source"] = source
++
++    def apply_batch(self, diff: str, payload: Any) -> int:
++        if not isinstance(payload, dict):
++            return 0
++        count = 0
++        for sid, entry in payload.items():
++            if not isinstance(entry, dict):
++                continue
++            self.apply_chart_votes(
++                str(sid), diff,
++                entry.get("topTags") or [],
++                entry.get("parentTagTotals") or {},
++                "top-batch",
++            )
++            count += 1
++        return count
+ 
+-    try:
+-        await page.evaluate("window.scrollTo(0, 0)")
+-        stable_bottom_rounds = 0
+-        last_y = -1
+-
+-        while clicked < max_clicks and stable_bottom_rounds < 6:
+-            candidates = await candidate_clickables(page, 160)
+-            for c in candidates:
+-                if clicked >= max_clicks:
+-                    break
+-                text = c["text"]
+-                if text in UI_EXCLUDE or text in seen_texts:
++    def apply_tree(self, sid: str, diff: str, tree: Any) -> None:
++        if not isinstance(tree, list):
++            return
++        secondary_by_id: dict[int, dict[str, Any]] = {}
++        totals = {rid: 0 for rid in self.root_names}
++        for root in tree:
++            if not isinstance(root, dict):
++                continue
++            for child in root.get("children") or []:
++                if not isinstance(child, dict):
+                     continue
+-                seen_texts.add(text)
+-                all_candidates.append(c)
+-
+                 try:
+-                    # Prefer exact text. If the list is virtualized, the candidate is currently in DOM.
+-                    loc = page.get_by_text(text, exact=True)
+-                    if await loc.count() == 0:
+-                        loc = page.locator("a,button,[role=button],[tabindex],[class*='cursor-pointer']").filter(has_text=text)
+-                    if await loc.count() == 0:
+-                        continue
+-
+-                    el = loc.first
+-                    await el.click(timeout=2200)
+-                    await page.wait_for_timeout(delay_ms)
+-                    clicked += 1
+-
+-                    snap = await page.evaluate("""() => {
+-                      const sel = [
+-                        '[role="dialog"]',
+-                        '[class*="modal"]',
+-                        '[class*="dialog"]',
+-                        '[class*="drawer"]',
+-                        '[class*="sheet"]'
+-                      ].join(',');
+-                      const nodes = Array.from(document.querySelectorAll(sel)).filter(x => {
+-                        const s = getComputedStyle(x);
+-                        const r = x.getBoundingClientRect();
+-                        return s.display !== 'none' && s.visibility !== 'hidden' && r.width > 10 && r.height > 10;
+-                      });
+-                      const text = nodes.length
+-                        ? nodes.map(x => (x.innerText || '').trim()).filter(Boolean).join('\\n---\\n')
+-                        : (document.body.innerText || '').slice(0, 12000);
+-                      return text.slice(0, 20000);
+-                    }""")
+-                    if any(x in snap for x in ("标签", "别名", "综合", "读谱", "硬抗", "拆谱", "定位", "多指")):
+-                        details_file.write(json.dumps({"clicked": text, "snapshot": snap}, ensure_ascii=False) + "\n")
+-                        details_file.flush()
+-
+-                    await page.keyboard.press("Escape")
+-                    await page.wait_for_timeout(80)
+-
+-                    if urlparse(page.url).path != "/songs":
+-                        await page.go_back(wait_until="domcontentloaded", timeout=30000)
+-                        await page.wait_for_timeout(250)
+-
++                    tid = int(child.get("id"))
+                 except Exception:
+-                    try:
+-                        await page.keyboard.press("Escape")
+-                    except Exception:
+-                        pass
+                     continue
+-
+-            # Advance roughly one viewport. New virtualized cards will enter the DOM.
+-            state = await page.evaluate("""() => {
+-              const y = window.scrollY;
+-              const h = window.innerHeight;
+-              const maxY = Math.max(0, document.documentElement.scrollHeight - h);
+-              const nextY = Math.min(maxY, y + Math.max(500, Math.floor(h * 0.82)));
+-              window.scrollTo(0, nextY);
+-              return {y, nextY, maxY};
+-            }""")
+-            await page.wait_for_timeout(180)
+-
+-            if state["nextY"] >= state["maxY"] - 2 and state["nextY"] == last_y:
+-                stable_bottom_rounds += 1
+-            elif state["nextY"] >= state["maxY"] - 2:
+-                stable_bottom_rounds += 1
++                current = secondary_by_id.get(tid)
++                if current is None or int(child.get("voteCount") or 0) > int(current.get("voteCount") or 0):
++                    secondary_by_id[tid] = child
++        for child in secondary_by_id.values():
++            votes = int(child.get("voteCount") or 0)
++            pids = child.get("parentIds") or []
++            for pid in pids:
++                try:
++                    pid_i = int(pid)
++                except Exception:
++                    continue
++                if pid_i in totals:
++                    totals[pid_i] += votes
++        self.apply_chart_votes(sid, diff, list(secondary_by_id.values()), totals, "tree-per-chart")
++
++    def nested(self) -> list[dict[str, Any]]:
++        aliases: dict[str, list[str]] = {}
++        for a in self.aliases:
++            aliases.setdefault(a["song_id"], []).append(a["alias"])
++        vote_map: dict[str, list[dict[str, Any]]] = {}
++        for v in self.votes:
++            vote_map.setdefault(v["chart_id"], []).append(v)
++        charts_by_song: dict[str, list[dict[str, Any]]] = {}
++        for c in self.charts:
++            item = dict(c)
++            vv = vote_map.get(c["chart_id"], [])
++            item["primary_votes"] = [x for x in vv if x["tag_type"] == "primary"]
++            item["secondary_votes"] = [x for x in vv if x["tag_type"] == "secondary"]
++            charts_by_song.setdefault(c["song_id"], []).append(item)
++        return [
++            {**s, "aliases": aliases.get(s["song_id"], []), "charts": charts_by_song.get(s["song_id"], [])}
++            for s in self.songs
++        ]
++
++
++async def fetch_tree_fallback(client: IsolatedBrowserClient, dataset: Dataset, out: Path,
++                              concurrency: int, retries: int) -> tuple[int, int]:
++    sem = asyncio.Semaphore(max(1, concurrency))
++    raw_dir = out / "raw" / "chart_trees"
++    raw_dir.mkdir(parents=True, exist_ok=True)
++    ok = 0
++    failed = 0
++    lock = asyncio.Lock()
++
++    async def one(chart: dict[str, Any]) -> None:
++        nonlocal ok, failed
++        sid = chart["song_id"]
++        diff = chart["difficulty"]
++        path = TAG_TREE_PATH + "?" + urlencode({"songId": sid, "difficulty": diff})
++        async with sem:
++            tree = await client.get_json(path, f"chart-tree:{sid}:{diff}", retries=retries)
++        async with lock:
++            if isinstance(tree, list):
++                ok += 1
++                dataset.apply_tree(sid, diff, tree)
++                write_json(raw_dir / f"{sid}__{diff}.json", tree)
+             else:
+-                stable_bottom_rounds = 0
+-            last_y = state["nextY"]
+-
+-        (out / "click_candidates.json").write_text(
+-            json.dumps(all_candidates, ensure_ascii=False, indent=2),
+-            encoding="utf-8",
+-        )
+-    finally:
+-        details_file.close()
+-
+-    return clicked
++                failed += 1
++            done = ok + failed
++            if done % 50 == 0 or done == len(dataset.charts):
++                print(f"  单谱 GET 进度 {done}/{len(dataset.charts)}，成功 {ok}，失败 {failed}")
+ 
+-def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+-    if not rows:
+-        path.write_text("", encoding="utf-8-sig")
+-        return
+-    fields = list(rows[0].keys())
+-    with path.open("w", newline="", encoding="utf-8-sig") as f:
+-        w = csv.DictWriter(f, fieldnames=fields)
+-        w.writeheader()
+-        w.writerows(rows)
++    await asyncio.gather(*(one(c) for c in dataset.charts))
++    return ok, failed
+ 
+-def dataclass_rows(rows: set) -> list[dict[str, Any]]:
+-    return [asdict(x) for x in sorted(rows, key=lambda x: tuple(str(v) for v in asdict(x).values()))]
+-
+-def write_outputs(out: Path, normalizer: Normalizer, recorder: Recorder, clicked: int, started_at: float) -> None:
+-    songs = dataclass_rows(normalizer.songs)
+-    aliases = dataclass_rows(normalizer.aliases)
+-    charts = dataclass_rows(normalizer.charts)
+-    votes = dataclass_rows(normalizer.votes)
+-
+-    # Remove obvious false-positive tag names when we have enough known tags to anchor the dataset.
+-    votes = [
+-        r for r in votes
+-        if r["tag"] in ALL_KNOWN_TAGS
+-        or any(x in r["path"].lower() for x in ("tag", "label", "标签"))
+-    ]
+-
+-    for name, data in (
+-        ("songs.json", songs),
+-        ("aliases.json", aliases),
+-        ("charts.json", charts),
+-        ("tag_votes.json", votes),
+-    ):
+-        (out / name).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+-
+-    write_csv(out / "songs.csv", songs)
+-    write_csv(out / "aliases.csv", aliases)
+-    write_csv(out / "charts.csv", charts)
+-    write_csv(out / "tag_votes.csv", votes)
+-
+-    (out / "network.json").write_text(json.dumps(recorder.records, ensure_ascii=False, indent=2), encoding="utf-8")
+-
+-    endpoints = sorted({
+-        (r["method"], r["url"])
+-        for r in recorder.records
+-        if r["resource_type"] in ("xhr", "fetch")
+-    })
+-    (out / "endpoints.txt").write_text(
+-        "\n".join(f"{m}\t{u}" for m, u in endpoints),
+-        encoding="utf-8",
+-    )
+-
+-    manifest = {
+-        "source": BASE_URL,
+-        "started_unix": started_at,
+-        "finished_unix": time.time(),
+-        "clicked_candidates": clicked,
+-        "raw_responses": len(recorder.records),
+-        "songs_rows": len(songs),
+-        "aliases_rows": len(aliases),
+-        "charts_rows": len(charts),
+-        "tag_vote_rows": len(votes),
+-        "known_primary_tags": sorted(PRIMARY_TAGS),
+-        "known_secondary_tags": sorted(SECONDARY_TAGS),
+-        "note": "raw/ + indexeddb.json + web_storage.json are retained so parser rules can be refined without recrawling.",
+-    }
+-    (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+ 
+ async def run(args: argparse.Namespace) -> int:
+     out = Path(args.out)
+     out.mkdir(parents=True, exist_ok=True)
+-    started_at = time.time()
+-
+-    normalizer = Normalizer()
+-    recorder = Recorder(out, normalizer)
+-
+-    cf_result: dict[str, Any] = {}
+-    body = ""
++    (out / "raw").mkdir(exist_ok=True)
++    started = time.time()
+ 
+     async with async_playwright() as p:
+         browser = await p.chromium.launch(headless=not args.headful)
+-        context = await browser.new_context(
+-            viewport={"width": 1440, "height": 1000},
+-            locale="zh-CN",
+-        )
+-        page = await context.new_page()
+-        page.on("response", recorder.schedule_response)
+-        browser_events: list[dict[str, Any]] = []
+-        page.on("console", lambda msg: browser_events.append({"type": "console", "level": msg.type, "text": msg.text}))
+-        page.on("pageerror", lambda exc: browser_events.append({"type": "pageerror", "text": str(exc)}))
+-        page.on("requestfailed", lambda req: browser_events.append({
+-            "type": "requestfailed", "url": req.url,
+-            "failure": (req.failure or "") if isinstance(req.failure, str) else str(req.failure),
+-        }))
+-
+-        print(f"[0/7] Cloudflare 预热：{CF_PROBE_URL}")
+-        cf_result = await warm_up_cloudflare(page, out, args.cf_timeout_ms)
+-        print(json.dumps(cf_result, ensure_ascii=False))
+-
+-        print(f"[1/7] 打开 {BASE_URL}")
+-        await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=90000)
+-        try:
+-            await page.wait_for_load_state("networkidle", timeout=30000)
+-        except Exception:
+-            pass
+-        body = await wait_for_song_page(page, retries=3)
+-
+-        print("[2/7] 自动滚动，触发列表懒加载")
+-        if "无法加载曲目列表" not in body and "加载失败" not in body:
+-            await auto_scroll(page)
+-            await page.wait_for_timeout(800)
+-            body = await page.locator("body").inner_text()
+-
+-        (out / "body.txt").write_text(body, encoding="utf-8")
+-        (out / "page.html").write_text(await page.content(), encoding="utf-8")
+-
+-        # Let script-response tasks finish, then inspect the loaded bundles for
+-        # read-only API strings and probe them via top-level navigation.
+-        await recorder.drain()
+-        recorder.write_diagnostics()
+-        print(f"[3/7] 前端 API 发现与只读探测：发现 {len(recorder.api_paths)} 个路径候选")
+-        api_probes = await probe_discovered_apis(page, out, recorder, normalizer, args.api_probe_limit)
+-        recorder.write_diagnostics()
+-        (out / "browser_events.json").write_text(
+-            json.dumps(browser_events, ensure_ascii=False, indent=2), encoding="utf-8"
+-        )
+-
+-        print("[4/7] 读取 localStorage / sessionStorage / IndexedDB")
+-        await dump_web_storage(page, out, normalizer)
+-        try:
+-            await dump_indexeddb(page, out, normalizer)
+-        except Exception as e:
+-            (out / "indexeddb_error.txt").write_text(str(e), encoding="utf-8")
+-
+-        clicked = 0
+-        if args.deep:
+-            print(f"[5/7] 深度探索：最多点击 {args.max_clicks} 个疑似歌曲卡片")
+-            clicked = await click_explore(page, out, args.max_clicks, args.delay_ms)
+-            await recorder.drain()
+-            # Clicks may populate browser caches.
+-            await dump_web_storage(page, out, normalizer)
+-            try:
+-                await dump_indexeddb(page, out, normalizer)
+-            except Exception:
+-                pass
+-        else:
+-            print("[5/7] 跳过深度点击（加 --deep 可启用）")
++        client = IsolatedBrowserClient(browser, out, args.retries, args.timeout_ms, args.pause_ms)
++
++        print("[1/6] 新上下文直取标签目录")
++        tag_tree = await client.get_json(TAG_TREE_PATH, "tag-catalog")
++        if not isinstance(tag_tree, list) or not tag_tree:
++            write_json(out / "manifest.json", {"ok": False, "reason": "tag_catalog_failed", "started_unix": started, "finished_unix": time.time()})
++            await browser.close()
++            print("错误：连标签目录都无法通过隔离上下文获取。", file=sys.stderr)
++            return 3
++        write_json(out / "raw" / "tag_catalog.json", tag_tree)
++        catalog_rows = flatten_catalog(tag_tree)
++        write_json(out / "tag_catalog.json", catalog_rows)
++        write_csv(out / "tag_catalog.csv", catalog_rows, ["tag_id", "tag", "tag_type", "parent_ids", "description"])
++        print(f"  标签目录：{len(catalog_rows)} 条")
++
++        print("[2/6] 新上下文直取完整歌曲列表")
++        songlist = await client.get_json(SONGLIST_PATH, "songlist")
++        if not isinstance(songlist, (dict, list)):
++            write_json(out / "manifest.json", {"ok": False, "reason": "songlist_failed", "started_unix": started, "finished_unix": time.time()})
++            await browser.close()
++            print("错误：/api/songs/songlist 仍被 Cloudflare 拦截。", file=sys.stderr)
++            return 5
++        write_json(out / "raw" / "songlist.json", songlist)
++        dataset = Dataset(tag_tree, songlist)
++        print(f"  歌曲 {len(dataset.songs)}，谱面 {len(dataset.charts)}，别名 {len(dataset.aliases)}")
++        if not dataset.songs or not dataset.charts:
++            await browser.close()
++            print("错误：songlist 返回成功，但字段结构未解析出歌曲/谱面。", file=sys.stderr)
++            return 4
++
++        print("[3/6] 尝试批量 POST 获取主/次标签票数")
++        diffs = []
++        for d in STANDARD_DIFFS + sorted({c["difficulty"] for c in dataset.charts}):
++            if d not in diffs and dataset.song_ids_for_diff(d):
++                diffs.append(d)
++
++        batch_ok = True
++        batch_calls = 0
++        batch_song_results = 0
++        raw_batch_dir = out / "raw" / "top_batch"
++        raw_batch_dir.mkdir(parents=True, exist_ok=True)
++
++        for diff in diffs:
++            ids = dataset.song_ids_for_diff(diff)
++            for chunk_no, batch_ids in chunks(ids, args.batch_size):
++                payload = {"songIds": batch_ids, "difficulty": diff, "limitPerSong": args.limit_per_song}
++                result = await client.post_json(TOP_BATCH_PATH, payload, f"top-batch:{diff}:{chunk_no}")
++                batch_calls += 1
++                if not isinstance(result, dict):
++                    batch_ok = False
++                    print(f"  批量 POST 被拦：{diff} 第 {chunk_no + 1} 批；切换单谱 GET 方案")
++                    break
++                write_json(raw_batch_dir / f"{diff}_{chunk_no:03d}.json", result)
++                batch_song_results += dataset.apply_batch(diff, result)
++                # Some batch APIs omit songs that currently have zero votes.
++                # An omitted requested song is therefore recorded as a valid
++                # all-zero chart instead of being mistaken for a crawl failure.
++                returned_ids = {str(x) for x in result.keys()}
++                for missing_sid in batch_ids:
++                    if str(missing_sid) not in returned_ids:
++                        dataset.apply_chart_votes(str(missing_sid), diff, [], {}, "top-batch")
++                print(f"  {diff.upper()} 第 {chunk_no + 1} 批：{len(batch_ids)} 首，返回 {len(result)} 首")
++                await asyncio.sleep(args.pause_ms / 1000)
++            if not batch_ok:
++                break
+ 
+-        await recorder.drain()
+-        recorder.write_diagnostics()
++        fallback_ok = fallback_failed = 0
++        strategy = "top-batch" if batch_ok else "batch-failed"
++        if not batch_ok:
++            # Discard incomplete vote rows from partially completed batches so
++            # every chart comes from one consistent strategy.
++            dataset.votes.clear()
++            dataset._vote_keys.clear()
++            for c in dataset.charts:
++                c.update({"main_label": "", "main_label_question": False, "main_top_votes": 0,
++                          "main_second_votes": 0, "tag_source": ""})
++            if args.tree_fallback:
++                strategy = "tree-per-chart"
++                print("[4/6] 降级：每张谱面用新上下文 GET /api/tags/tree?songId&difficulty")
++                fallback_ok, fallback_failed = await fetch_tree_fallback(
++                    client, dataset, out, args.tree_concurrency, args.tree_retries
++                )
++            else:
++                # Scheduled jobs do not automatically fire thousands of requests.
++                # Probe a few charts so the artifact still tells us whether the
++                # per-chart GET fallback is viable, then fail cleanly.
++                print("[4/6] 批量 POST 失败；仅探测 3 张谱面（定时任务默认不进行数千次逐谱请求）")
++                probe_charts = dataset.charts[:3]
++                for chart in probe_charts:
++                    sid, diff = chart["song_id"], chart["difficulty"]
++                    path = TAG_TREE_PATH + "?" + urlencode({"songId": sid, "difficulty": diff})
++                    tree = await client.get_json(path, f"fallback-probe:{sid}:{diff}", retries=1)
++                    if isinstance(tree, list):
++                        fallback_ok += 1
++                        dataset.apply_tree(sid, diff, tree)
++                    else:
++                        fallback_failed += 1
++        else:
++            print("[4/6] 批量接口成功，不需要逐谱请求")
++
++        print("[5/6] 输出标准表")
++        song_fields = ["song_id", "name", "pack"]
++        alias_fields = ["song_id", "song_name", "alias"]
++        chart_fields = ["chart_id", "song_id", "song_name", "difficulty", "constant", "main_label",
++                        "main_label_question", "main_top_votes", "main_second_votes", "tag_source"]
++        vote_fields = ["chart_id", "song_id", "song_name", "difficulty", "tag_type", "tag_id", "tag",
++                       "votes", "parent_ids", "source"]
++        write_json(out / "songs.json", dataset.songs)
++        write_json(out / "aliases.json", dataset.aliases)
++        write_json(out / "charts.json", dataset.charts)
++        write_json(out / "tag_votes.json", dataset.votes)
++        write_json(out / "data.json", dataset.nested())
++        write_csv(out / "songs.csv", dataset.songs, song_fields)
++        write_csv(out / "aliases.csv", dataset.aliases, alias_fields)
++        write_csv(out / "charts.csv", dataset.charts, chart_fields)
++        write_csv(out / "tag_votes.csv", dataset.votes, vote_fields)
++
++        charts_with_tags = sum(1 for c in dataset.charts if c.get("tag_source"))
++        primary_rows = sum(1 for v in dataset.votes if v["tag_type"] == "primary")
++        secondary_rows = sum(1 for v in dataset.votes if v["tag_type"] == "secondary")
++        manifest = {
++            "ok": bool(dataset.songs and dataset.charts and charts_with_tags),
++            "source": SITE_ORIGIN,
++            "started_unix": started,
++            "finished_unix": time.time(),
++            "last_update": songlist.get("lastUpdate", "") if isinstance(songlist, dict) else "",
++            "strategy": strategy,
++            "songs_rows": len(dataset.songs),
++            "aliases_rows": len(dataset.aliases),
++            "charts_rows": len(dataset.charts),
++            "charts_with_tags": charts_with_tags,
++            "tag_vote_rows": len(dataset.votes),
++            "primary_vote_rows": primary_rows,
++            "secondary_vote_rows": secondary_rows,
++            "batch_calls": batch_calls,
++            "batch_song_results": batch_song_results,
++            "fallback_ok": fallback_ok,
++            "fallback_failed": fallback_failed,
++            "api_attempts": len(client.attempts),
++            "batch_limit_per_song": args.limit_per_song,
++        }
++        write_json(out / "manifest.json", manifest)
+         await browser.close()
+ 
+-    print("[6/7] 归一化并写出 CSV / JSON")
+-    write_outputs(out, normalizer, recorder, clicked, started_at)
+-
+-    manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+-    manifest["cloudflare"] = cf_result
+-    manifest["page_load_failed"] = ("无法加载曲目列表" in body or "加载失败" in body)
+-    manifest["saved_scripts"] = recorder.script_count
+-    manifest["discovered_api_paths"] = sorted(recorder.api_paths)
+-    manifest["api_probe_count"] = len(api_probes) if "api_probes" in locals() else 0
+-    (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
++    print("[6/6] 完整性检查")
+     print(json.dumps(manifest, ensure_ascii=False, indent=2))
+-
+-    print("[7/7] 完整性检查")
+-    if not cf_result.get("passed"):
+-        print("错误：Cloudflare 顶层导航也未通过。诊断文件已保留。", file=sys.stderr)
+-        return 3
+-    if manifest["page_load_failed"] and manifest["songs_rows"] == 0 and manifest["charts_rows"] == 0:
+-        print(
+-            "错误：标签 API 的顶层导航已通过，但 /songs 内部 fetch 仍加载失败。"
+-            "已保存 api_traffic.json、scripts/、frontend_api_strings.json 和 api_probes.json。",
+-            file=sys.stderr,
+-        )
+-        return 5
+-    if manifest["raw_responses"] == 0:
+-        print("错误：没有捕获到数据响应。", file=sys.stderr)
+-        return 2
+-    if manifest["songs_rows"] == 0 and manifest["charts_rows"] == 0 and manifest["tag_vote_rows"] == 0:
+-        print("错误：已通过页面加载，但归一化结果仍为空；请检查 raw/ 后补字段映射。", file=sys.stderr)
++    if not manifest["songs_rows"] or not manifest["charts_rows"]:
+         return 4
++    if strategy == "batch-failed":
++        print("错误：批量标签 POST 仍被拦截；只做了少量逐谱 GET 探测，未生成可发布的完整快照。", file=sys.stderr)
++        return 8
++    if manifest["charts_with_tags"] == 0:
++        print("错误：歌曲和谱面抓到了，但标签投票仍全部失败。", file=sys.stderr)
++        return 6
++    # Partial per-chart fallback is useful as a diagnostic but not safe to
++    # publish as a supposedly complete latest snapshot.
++    if strategy == "tree-per-chart" and fallback_failed:
++        print(f"错误：逐谱抓取有 {fallback_failed} 张失败，不应覆盖 latest。", file=sys.stderr)
++        return 7
+     return 0
+ 
++
+ def parse_args() -> argparse.Namespace:
+-    ap = argparse.ArgumentParser(description="抓取 kyou.net.cn/songs 的歌曲、谱面、别名与标签投票")
+-    ap.add_argument("--out", default="output", help="输出目录")
+-    ap.add_argument("--deep", action="store_true", help="自动点击疑似歌曲卡片，触发详情/投票懒加载")
+-    ap.add_argument("--max-clicks", type=int, default=2200, help="深度模式最多点击数量")
+-    ap.add_argument("--delay-ms", type=int, default=250, help="每次点击后的等待，默认 250ms")
+-    ap.add_argument("--headful", action="store_true", help="显示浏览器窗口；GitHub Actions 建议配合 xvfb-run")
+-    ap.add_argument("--cf-timeout-ms", type=int, default=45000, help="等待 Cloudflare 浏览器挑战的最长时间")
+-    ap.add_argument("--api-probe-limit", type=int, default=80, help="最多探测多少个前端发现的只读 API 路径")
++    ap = argparse.ArgumentParser(description="直接调用 kyou.net.cn 真实 API，抓歌曲、别名、谱面和标签票数")
++    ap.add_argument("--out", default="output")
++    ap.add_argument("--headful", action="store_true", help="GitHub Actions 下配合 xvfb-run")
++    ap.add_argument("--timeout-ms", type=int, default=30000)
++    ap.add_argument("--retries", type=int, default=3)
++    ap.add_argument("--pause-ms", type=int, default=350, help="API 调用间基础停顿，避免给站点造成突发压力")
++    ap.add_argument("--batch-size", type=int, default=200, help="前端本身使用 200 首一批")
++    ap.add_argument("--limit-per-song", type=int, default=100, help="批量接口返回每首歌最多多少个次标签")
++    ap.add_argument("--tree-fallback", action="store_true", help="批量 POST 失败时允许逐张谱面 GET；会产生较多请求，定时任务默认关闭")
++    ap.add_argument("--tree-concurrency", type=int, default=3, help="逐谱 GET 的并发数")
++    ap.add_argument("--tree-retries", type=int, default=2)
+     return ap.parse_args()
+ 
++
+ if __name__ == "__main__":
+     raise SystemExit(asyncio.run(run(parse_args())))

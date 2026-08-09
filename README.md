@@ -1,96 +1,61 @@
-# kyou-crawler
+# kyou-crawler v4
 
-抓取 `https://kyou.net.cn/songs` 当前页面实际加载的数据，并整理出：
+抓取 `https://kyou.net.cn` 的 Phigros 定数表、别名以及谱面标签投票。
 
-- `songs.csv/json`：歌曲
-- `aliases.csv/json`：别名
-- `charts.csv/json`：谱面
-- `tag_votes.csv/json`：主/次标签与票数
-- `network.json` / `endpoints.txt`：实际捕获到的接口
-- `raw/`：原始接口响应
-- `web_storage.json`：localStorage / sessionStorage
-- `indexeddb.json`：IndexedDB
-- `detail_snapshots.ndjson`：深度模式点击详情后看到的文本快照
+v4 不再依赖 `/songs` 页面 DOM。根据站点当前前端 bundle 逆出的真实接口直接取数：
 
-## 安装
+- `GET /api/songs/songlist`：歌曲、别名、各难度定数
+- `GET /api/tags/tree`：标签目录
+- `POST /api/tags/top-batch`：批量谱面标签票数、主标签汇总
+- `GET /api/tags/tree?songId=...&difficulty=...`：单谱完整投票（仅作为备用）
 
-PowerShell：
+## 为什么要“隔离浏览器上下文”
+
+GitHub Hosted Runner 上，Cloudflare 对 `/songs` 内部的 `fetch` 会返回 403，但干净 Chromium 上下文的第一个顶层 API 请求可以通过。v4 因此让关键 API 调用在新的浏览器上下文中执行。
+
+对于批量 POST，v4 有两种尝试：
+
+1. 把顶层文档导航在浏览器请求层改写成 JSON POST；
+2. 使用本地 fulfilled 的同源 bootstrap 页面，让 POST fetch 成为新上下文的第一个真实网络请求。
+
+这样不需要逐个点击 1600+ 首歌。
+
+## 输出
+
+成功时 `output/` 包含：
+
+- `songs.csv/json`
+- `aliases.csv/json`
+- `charts.csv/json`
+- `tag_votes.csv/json`
+- `tag_catalog.csv/json`
+- `data.json`：按歌曲聚合的完整数据
+- `manifest.json`
+- `api_attempts.json`：每次 API 尝试及 HTTP 状态
+- `raw/songlist.json`
+- `raw/tag_catalog.json`
+- `raw/top_batch/*.json`
+
+`charts.csv` 的 `main_label` 会按网站前端当前规则计算：主属性前两名占比差不超过 10% 时显示“综合”；最高主属性票数低于 20 时 `main_label_question=true`。
+
+`tag_votes.csv` 中：
+
+- `tag_type=primary`：五个真实主属性（读谱、硬抗、拆谱、定位、多指）的汇总票数；
+- `tag_type=secondary`：细标签票数；
+- “综合”不是后端标签节点，而是前端根据主属性票数推导出的显示标签，所以放在 `charts.main_label`，不会伪造为一条投票。
+
+## 本地运行
 
 ```powershell
-py -m venv .venv; .\.venv\Scripts\Activate.ps1; py -m pip install -r .\requirements.txt; py -m playwright install chromium
+py -m venv .venv; .\.venv\Scripts\Activate.ps1; py -m pip install -r .\requirements.txt; py -m playwright install chromium; py .\crawler.py --headful --out output
 ```
 
-## 运行
+## GitHub Actions
 
-建议第一次直接深度抓取：
+定时任务默认只使用批量接口，避免在批量接口失败时自动产生数千次逐谱请求。
 
-```powershell
-.\.venv\Scripts\Activate.ps1; py .\crawler.py --deep
-```
+如果需要人工验证逐谱 GET 备用方案，在 Actions 的 **Run workflow** 中勾选 `tree_fallback`。这会显著增加请求量，不建议作为小时级定时策略。
 
-调试（显示 Chromium）：
+## 完整性
 
-```powershell
-.\.venv\Scripts\Activate.ps1; py .\crawler.py --deep --headful
-```
-
-输出默认在 `output\`。
-
-## 为什么同时保留 raw / IndexedDB
-
-这个站点是动态页面，而且页面明确存在缓存行为。爬虫不把成功与否押在某一个 API 路径或某一套 DOM class 上：
-
-1. 监听 `fetch/XHR/document`；
-2. 自动滚动触发懒加载；
-3. 抽取 localStorage / sessionStorage；
-4. 抽取所有 IndexedDB 数据库；
-5. `--deep` 时自动点击高概率歌曲卡片以触发详情、标签、评论等延迟请求；
-6. 对所有结构化数据递归归一化。
-
-即使站点字段改名，`raw/` 仍保留原始响应，后续只需修 parser，不需要重新猜接口。
-
-## 建议的首次验证
-
-跑完看 `output\manifest.json`。重点是：
-
-- `raw_responses` > 0
-- `songs_rows`
-- `aliases_rows`
-- `charts_rows`
-- `tag_vote_rows`
-
-以及打开 `output\endpoints.txt`，这里就是脚本实际观察到的数据请求。
-
-如果归一化表某列为空，但 `raw/` 里有数据，说明只是字段名没命中规则，不代表没抓到。把对应 raw JSON 的一小段结构提供出来即可精确补 parser。
-
-
-## v2：Cloudflare 处理
-
-GitHub 托管 Runner 可能会让 `https://kyou.net.cn/api/tags/tree` 返回 Cloudflare 的 `403 Just a moment...`。
-
-v2 会先把该 API 作为顶层页面打开，让浏览器有机会执行 Cloudflare 的浏览器挑战；通过后再进入 `/songs`。GitHub Actions 使用 `xvfb-run + --headful` 运行真实有界面 Chromium。
-
-如果 Cloudflare 仍拒绝 GitHub 的机房 IP，任务会明确失败（不会再出现“绿了但 0 条数据”），同时 `if: always()` 保留完整 Artifact 供诊断。
-
-运行结果新增：
-
-- `cloudflare.json`：挑战通过情况、状态码、是否获得 `cf_clearance`
-- `cloudflare.html`：挑战最后页面
-- `manifest.json.page_load_failed`：曲目页是否仍加载失败
-
-如果 v2 仍持续返回 Cloudflare 403，说明站点策略直接拒绝 GitHub 托管 Runner 的出口 IP。此时最稳定的做法是换 GitHub self-hosted runner（你的电脑/家里小主机）或其他允许访问该站点的固定运行环境，而不是继续堆解析规则。
-
-## v3 诊断/直连模式
-
-v3 针对 GitHub Hosted Runner 上出现的特殊情况：`/api/tags/tree` 作为顶层页面访问能返回 200 JSON，但 `/songs` 内部的 `fetch` 仍可能加载失败。
-
-新增输出：
-
-- `tag_catalog.json`：标签目录（不会再误记为谱面投票）
-- `api_traffic.json`：所有同源 `/api/*` 请求的状态码/类型/响应前缀
-- `scripts/`：页面实际加载的同源 JS bundle
-- `frontend_api_strings.json`：从 JS bundle 中静态提取的 `/api/...` 字符串及上下文
-- `api_probes.json`：对发现的安全只读 API 进行顶层 GET 导航探测的结果
-- `browser_events.json`：console/pageerror/requestfailed 诊断
-
-只读 API 探测会跳过名称中包含登录、用户、投票、评论、更新、删除、上传等明显有副作用的接口。
+只有歌曲、谱面和标签数据完整时脚本才返回 0。失败时 Actions 会变红，但 `if: always()` 仍会上传诊断 Artifact，便于继续定位。

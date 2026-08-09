@@ -2,6 +2,12 @@ name: Crawl kyou data
 
 on:
   workflow_dispatch:
+    inputs:
+      tree_fallback:
+        description: "批量标签接口失败时，允许逐张谱面 GET（请求量较大，仅调试时打开）"
+        required: false
+        type: boolean
+        default: false
   schedule:
     - cron: "17 * * * *"
 
@@ -11,7 +17,7 @@ permissions:
 jobs:
   crawl:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
 
@@ -27,7 +33,11 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y xvfb
 
       - name: Crawl
-        run: xvfb-run -a python crawler.py --deep --headful --out output
+        shell: bash
+        run: |
+          EXTRA=""
+          if [ "${{ inputs.tree_fallback }}" = "true" ]; then EXTRA="--tree-fallback"; fi
+          xvfb-run -a python crawler.py --headful --out output $EXTRA
 
       - name: Upload crawl artifact
         if: always()
