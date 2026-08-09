@@ -1,0 +1,430 @@
+diff --git a/README.md b/README.md
+index f996dbf..4d553e6 100644
+--- a/README.md
++++ b/README.md
+@@ -79,3 +79,18 @@ v2 会先把该 API 作为顶层页面打开，让浏览器有机会执行 Cloud
+ - `manifest.json.page_load_failed`：曲目页是否仍加载失败
+ 
+ 如果 v2 仍持续返回 Cloudflare 403，说明站点策略直接拒绝 GitHub 托管 Runner 的出口 IP。此时最稳定的做法是换 GitHub self-hosted runner（你的电脑/家里小主机）或其他允许访问该站点的固定运行环境，而不是继续堆解析规则。
++
++## v3 诊断/直连模式
++
++v3 针对 GitHub Hosted Runner 上出现的特殊情况：`/api/tags/tree` 作为顶层页面访问能返回 200 JSON，但 `/songs` 内部的 `fetch` 仍可能加载失败。
++
++新增输出：
++
++- `tag_catalog.json`：标签目录（不会再误记为谱面投票）
++- `api_traffic.json`：所有同源 `/api/*` 请求的状态码/类型/响应前缀
++- `scripts/`：页面实际加载的同源 JS bundle
++- `frontend_api_strings.json`：从 JS bundle 中静态提取的 `/api/...` 字符串及上下文
++- `api_probes.json`：对发现的安全只读 API 进行顶层 GET 导航探测的结果
++- `browser_events.json`：console/pageerror/requestfailed 诊断
++
++只读 API 探测会跳过名称中包含登录、用户、投票、评论、更新、删除、上传等明显有副作用的接口。
+diff --git a/crawler.py b/crawler.py
+index a841192..34d636c 100644
+--- a/crawler.py
++++ b/crawler.py
+@@ -11,12 +11,13 @@ import time
+ from dataclasses import dataclass, asdict
+ from pathlib import Path
+ from typing import Any
+-from urllib.parse import urlparse
++from urllib.parse import urlparse, urljoin
+ 
+ from playwright.async_api import async_playwright, Page, Response
+ 
+ BASE_URL = "https://kyou.net.cn/songs"
+ CF_PROBE_URL = "https://kyou.net.cn/api/tags/tree"
++SITE_ORIGIN = "https://kyou.net.cn"
+ 
+ PRIMARY_TAGS = {"综合", "读谱", "硬抗", "拆谱", "定位", "多指"}
+ SECONDARY_TAGS = {
+@@ -263,7 +264,12 @@ class Normalizer:
+                     or any(any(h in norm_key(k) for h in TAG_HINTS) for k in obj.keys())
+                     or any(any(h in norm_key(k) for h in VOTE_HINTS) for k in obj.keys())
+                 )
+-                if looks_taggy:
++                # A bare tag-tree node (name + voteCount) is tag metadata, not a
++                # chart vote. Require chart/song context before emitting VoteRow.
++                has_chart_context = bool(
++                    local.get("chart_id") or local.get("difficulty") or song_name or song_id
++                )
++                if looks_taggy and has_chart_context:
+                     self.votes.add(
+                         VoteRow(
+                             local.get("chart_id", ""),
+@@ -281,7 +287,12 @@ class Normalizer:
+             # Map-shaped votes: {"综合": 12, "定位": 8} or {"tags": {"综合": 12}}
+             for k, v in obj.items():
+                 ks = str(k).strip()
+-                if ks in ALL_KNOWN_TAGS and isinstance(v, (int, float)) and not isinstance(v, bool):
++                if (
++                    ks in ALL_KNOWN_TAGS
++                    and isinstance(v, (int, float))
++                    and not isinstance(v, bool)
++                    and (local.get("chart_id") or local.get("difficulty") or song_name or song_id)
++                ):
+                     self.votes.add(
+                         VoteRow(
+                             local.get("chart_id", ""),
+@@ -308,10 +319,16 @@ class Recorder:
+         self.out = out
+         self.normalizer = normalizer
+         self.raw_dir = out / "raw"
++        self.script_dir = out / "scripts"
+         self.raw_dir.mkdir(parents=True, exist_ok=True)
++        self.script_dir.mkdir(parents=True, exist_ok=True)
+         self.seen_hashes: set[str] = set()
+         self.records: list[dict[str, Any]] = []
++        self.api_traffic: list[dict[str, Any]] = []
++        self.api_strings: list[dict[str, Any]] = []
++        self.api_paths: set[str] = set()
+         self.pending: set[asyncio.Task] = set()
++        self.script_count = 0
+ 
+     def schedule_response(self, response: Response) -> None:
+         task = asyncio.create_task(self._handle_response(response))
+@@ -322,13 +339,91 @@ class Recorder:
+         if self.pending:
+             await asyncio.gather(*list(self.pending), return_exceptions=True)
+ 
++    def _extract_api_strings(self, text: str, source: str) -> None:
++        # Front-end bundles often build URLs by concatenation, so keep both the
++        # nearest literal-looking path and a context snippet around every /api/.
++        for m in re.finditer(r"/api/", text):
++            i = m.start()
++            tail = text[i:i + 300]
++            pm = re.match(r"/api/[A-Za-z0-9_./?=&%:+~@,-]*", tail)
++            path = (pm.group(0) if pm else "/api/").rstrip('.,;')
++            if len(path) > 5:
++                self.api_paths.add(path)
++            self.api_strings.append({
++                "source": source,
++                "path_guess": path,
++                "context": text[max(0, i - 180): i + 360],
++            })
++
++    def _flatten_tag_tree(self, obj: Any) -> list[dict[str, Any]]:
++        out: list[dict[str, Any]] = []
++        def walk(x: Any, inherited_parent: int | None = None) -> None:
++            if isinstance(x, list):
++                for y in x:
++                    walk(y, inherited_parent)
++                return
++            if not isinstance(x, dict):
++                return
++            if "id" in x and "name" in x:
++                out.append({
++                    "id": x.get("id"),
++                    "name": x.get("name"),
++                    "parentIds": x.get("parentIds", []),
++                    "description": x.get("description"),
++                    "sortOrder": x.get("sortOrder"),
++                    "status": x.get("status"),
++                })
++            for y in x.get("children", []) if isinstance(x.get("children"), list) else []:
++                walk(y, x.get("id"))
++        walk(obj)
++        # same secondary tag may appear below multiple parents; dedupe by id
++        dedup: dict[str, dict[str, Any]] = {}
++        for row in out:
++            dedup[str(row.get("id"))] = row
++        return list(dedup.values())
++
+     async def _handle_response(self, response: Response) -> None:
+         try:
+             req = response.request
+             rt = req.resource_type
++            ct = (response.headers.get("content-type") or "").lower()
++            same_origin_api = response.url.startswith(SITE_ORIGIN + "/api/")
++
++            # Always record same-origin API traffic, even if the response is HTML,
++            # empty, duplicated, or otherwise not parseable. This is diagnostic truth.
++            if same_origin_api:
++                api_meta = {
++                    "url": response.url,
++                    "status": response.status,
++                    "method": req.method,
++                    "resource_type": rt,
++                    "content_type": ct,
++                    "post_data": req.post_data,
++                }
++                try:
++                    txt = await response.text()
++                    api_meta["body_prefix"] = txt[:1600]
++                except Exception as e:
++                    api_meta["body_error"] = repr(e)
++                self.api_traffic.append(api_meta)
++
++            # Save same-origin JS bundles and statically discover API strings.
++            if rt == "script" and response.url.startswith(SITE_ORIGIN + "/"):
++                try:
++                    text = await response.text()
++                    if text and len(text) <= 12_000_000:
++                        self.script_count += 1
++                        name = Path(urlparse(response.url).path).name or f"script_{self.script_count}.js"
++                        safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
++                        target = self.script_dir / f"{self.script_count:03d}_{safe_name}"
++                        target.write_text(text, encoding="utf-8")
++                        self._extract_api_strings(text, response.url)
++                except Exception:
++                    pass
++                return
++
+             if rt not in ("xhr", "fetch", "document"):
+                 return
+-            ct = (response.headers.get("content-type") or "").lower()
+             if not any(x in ct for x in ("json", "javascript", "text/plain", "text/html")):
+                 return
+             text = await response.text()
+@@ -338,8 +433,7 @@ class Recorder:
+             try:
+                 parsed = json.loads(text)
+             except Exception:
+-                # Keep text only when it looks relevant.
+-                if not any(x in text for x in ("综合", "读谱", "硬抗", "拆谱", "定位", "多指", "alias", "vote", "tag", "别名", "标签")):
++                if not any(x in text for x in ("综合", "读谱", "硬抗", "拆谱", "定位", "多指", "alias", "vote", "tag", "别名", "标签", "song", "chart")):
+                     return
+                 parsed = {"_text": text}
+ 
+@@ -363,10 +457,33 @@ class Recorder:
+                 "sha256": h,
+             }
+             self.records.append(meta)
++
++            if response.url.split("?", 1)[0] == CF_PROBE_URL and isinstance(parsed, list):
++                catalog = self._flatten_tag_tree(parsed)
++                (self.out / "tag_catalog.json").write_text(
++                    json.dumps(catalog, ensure_ascii=False, indent=2), encoding="utf-8"
++                )
++
+             self.normalizer.add_blob(parsed, response.url)
+         except Exception:
+             return
+ 
++    def write_diagnostics(self) -> None:
++        (self.out / "api_traffic.json").write_text(
++            json.dumps(self.api_traffic, ensure_ascii=False, indent=2), encoding="utf-8"
++        )
++        # Dedupe huge minified-bundle repeats by (source,path,context).
++        seen: set[str] = set()
++        rows: list[dict[str, Any]] = []
++        for row in self.api_strings:
++            k = sha(row)
++            if k in seen:
++                continue
++            seen.add(k)
++            rows.append(row)
++        (self.out / "frontend_api_strings.json").write_text(
++            json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
++        )
+ 
+ 
+ async def warm_up_cloudflare(page: Page, out: Path, timeout_ms: int = 45000) -> dict[str, Any]:
+@@ -466,6 +583,95 @@ async def wait_for_song_page(page: Page, retries: int = 3) -> str:
+ 
+     return last_body
+ 
++def _safe_probe_path(raw: str) -> str | None:
++    path = raw.strip().strip('"\'` ')
++    if not path.startswith("/api/"):
++        return None
++    # Dynamic placeholders need concrete IDs/params and are not useful as-is.
++    if any(x in path for x in ("${", "{", "}", "[", "]", "<", ">")):
++        return None
++    # Never probe mutation/auth/account endpoints, even with GET.
++    low = path.lower()
++    blocked = (
++        "login", "logout", "register", "password", "delete", "remove", "create",
++        "update", "upload", "admin", "vote", "comment", "like", "favorite",
++        "auth", "send", "report", "user/", "profile",
++    )
++    if any(x in low for x in blocked):
++        return None
++    # Trim obvious minifier punctuation accidentally captured at the end.
++    path = path.rstrip("),;:.+-")
++    return path if len(path) > 5 else None
++
++
++async def probe_discovered_apis(
++    page: Page,
++    out: Path,
++    recorder: Recorder,
++    normalizer: Normalizer,
++    limit: int = 80,
++) -> list[dict[str, Any]]:
++    """Probe statically discovered same-origin APIs using top-level GET navigation.
++
++    On this site Cloudflare has been observed to treat fetch/XHR and top-level
++    document navigation differently. We deliberately only use safe GET navigation
++    and skip endpoints whose names suggest mutations/auth/user actions.
++    """
++    await recorder.drain()
++    candidates: list[str] = []
++    seen: set[str] = set()
++    for raw in sorted(recorder.api_paths):
++        pth = _safe_probe_path(raw)
++        if not pth or pth in seen:
++            continue
++        seen.add(pth)
++        candidates.append(pth)
++
++    # A few known read-only endpoints are useful even if bundle extraction misses
++    # them because of string concatenation/minification.
++    for pth in ("/api/tags/tree",):
++        if pth not in seen:
++            candidates.append(pth)
++            seen.add(pth)
++
++    results: list[dict[str, Any]] = []
++    probe_page = await page.context.new_page()
++    probe_page.on("response", recorder.schedule_response)
++    try:
++        for pth in candidates[:limit]:
++            url = urljoin(SITE_ORIGIN, pth)
++            row: dict[str, Any] = {"path": pth, "url": url}
++            try:
++                resp = await probe_page.goto(url, wait_until="domcontentloaded", timeout=30000)
++                if resp is not None:
++                    row["status"] = resp.status
++                    row["content_type"] = (resp.headers.get("content-type") or "").lower()
++                text = (await probe_page.locator("body").inner_text())[:2_000_000]
++                row["body_prefix"] = text[:1200]
++                try:
++                    data = json.loads(text)
++                    row["json"] = True
++                    row["json_type"] = type(data).__name__
++                    if isinstance(data, list):
++                        row["json_items"] = len(data)
++                    elif isinstance(data, dict):
++                        row["json_keys"] = list(data.keys())[:40]
++                    normalizer.add_blob(data, url + "#top-level-probe")
++                except Exception:
++                    row["json"] = False
++            except Exception as e:
++                row["error"] = repr(e)
++            results.append(row)
++    finally:
++        await recorder.drain()
++        await probe_page.close()
++
++    (out / "api_probes.json").write_text(
++        json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8"
++    )
++    return results
++
++
+ async def dump_web_storage(page: Page, out: Path, normalizer: Normalizer) -> None:
+     storage = await page.evaluate("""() => {
+       const read = (s) => {
+@@ -763,12 +969,19 @@ async def run(args: argparse.Namespace) -> int:
+         )
+         page = await context.new_page()
+         page.on("response", recorder.schedule_response)
+-
+-        print(f"[0/6] Cloudflare 预热：{CF_PROBE_URL}")
++        browser_events: list[dict[str, Any]] = []
++        page.on("console", lambda msg: browser_events.append({"type": "console", "level": msg.type, "text": msg.text}))
++        page.on("pageerror", lambda exc: browser_events.append({"type": "pageerror", "text": str(exc)}))
++        page.on("requestfailed", lambda req: browser_events.append({
++            "type": "requestfailed", "url": req.url,
++            "failure": (req.failure or "") if isinstance(req.failure, str) else str(req.failure),
++        }))
++
++        print(f"[0/7] Cloudflare 预热：{CF_PROBE_URL}")
+         cf_result = await warm_up_cloudflare(page, out, args.cf_timeout_ms)
+         print(json.dumps(cf_result, ensure_ascii=False))
+ 
+-        print(f"[1/6] 打开 {BASE_URL}")
++        print(f"[1/7] 打开 {BASE_URL}")
+         await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=90000)
+         try:
+             await page.wait_for_load_state("networkidle", timeout=30000)
+@@ -776,7 +989,7 @@ async def run(args: argparse.Namespace) -> int:
+             pass
+         body = await wait_for_song_page(page, retries=3)
+ 
+-        print("[2/6] 自动滚动，触发列表懒加载")
++        print("[2/7] 自动滚动，触发列表懒加载")
+         if "无法加载曲目列表" not in body and "加载失败" not in body:
+             await auto_scroll(page)
+             await page.wait_for_timeout(800)
+@@ -785,7 +998,18 @@ async def run(args: argparse.Namespace) -> int:
+         (out / "body.txt").write_text(body, encoding="utf-8")
+         (out / "page.html").write_text(await page.content(), encoding="utf-8")
+ 
+-        print("[3/6] 读取 localStorage / sessionStorage / IndexedDB")
++        # Let script-response tasks finish, then inspect the loaded bundles for
++        # read-only API strings and probe them via top-level navigation.
++        await recorder.drain()
++        recorder.write_diagnostics()
++        print(f"[3/7] 前端 API 发现与只读探测：发现 {len(recorder.api_paths)} 个路径候选")
++        api_probes = await probe_discovered_apis(page, out, recorder, normalizer, args.api_probe_limit)
++        recorder.write_diagnostics()
++        (out / "browser_events.json").write_text(
++            json.dumps(browser_events, ensure_ascii=False, indent=2), encoding="utf-8"
++        )
++
++        print("[4/7] 读取 localStorage / sessionStorage / IndexedDB")
+         await dump_web_storage(page, out, normalizer)
+         try:
+             await dump_indexeddb(page, out, normalizer)
+@@ -794,7 +1018,7 @@ async def run(args: argparse.Namespace) -> int:
+ 
+         clicked = 0
+         if args.deep:
+-            print(f"[4/6] 深度探索：最多点击 {args.max_clicks} 个疑似歌曲卡片")
++            print(f"[5/7] 深度探索：最多点击 {args.max_clicks} 个疑似歌曲卡片")
+             clicked = await click_explore(page, out, args.max_clicks, args.delay_ms)
+             await recorder.drain()
+             # Clicks may populate browser caches.
+@@ -804,24 +1028,35 @@ async def run(args: argparse.Namespace) -> int:
+             except Exception:
+                 pass
+         else:
+-            print("[4/6] 跳过深度点击（加 --deep 可启用）")
++            print("[5/7] 跳过深度点击（加 --deep 可启用）")
+ 
+         await recorder.drain()
++        recorder.write_diagnostics()
+         await browser.close()
+ 
+-    print("[5/6] 归一化并写出 CSV / JSON")
++    print("[6/7] 归一化并写出 CSV / JSON")
+     write_outputs(out, normalizer, recorder, clicked, started_at)
+ 
+     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+     manifest["cloudflare"] = cf_result
+     manifest["page_load_failed"] = ("无法加载曲目列表" in body or "加载失败" in body)
++    manifest["saved_scripts"] = recorder.script_count
++    manifest["discovered_api_paths"] = sorted(recorder.api_paths)
++    manifest["api_probe_count"] = len(api_probes) if "api_probes" in locals() else 0
+     (out / "manifest.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+     print(json.dumps(manifest, ensure_ascii=False, indent=2))
+ 
+-    print("[6/6] 完整性检查")
+-    if not cf_result.get("passed") or manifest["page_load_failed"]:
+-        print("错误：Cloudflare 挑战未通过，曲目 API 仍被拦截。诊断文件已保留。", file=sys.stderr)
++    print("[7/7] 完整性检查")
++    if not cf_result.get("passed"):
++        print("错误：Cloudflare 顶层导航也未通过。诊断文件已保留。", file=sys.stderr)
+         return 3
++    if manifest["page_load_failed"] and manifest["songs_rows"] == 0 and manifest["charts_rows"] == 0:
++        print(
++            "错误：标签 API 的顶层导航已通过，但 /songs 内部 fetch 仍加载失败。"
++            "已保存 api_traffic.json、scripts/、frontend_api_strings.json 和 api_probes.json。",
++            file=sys.stderr,
++        )
++        return 5
+     if manifest["raw_responses"] == 0:
+         print("错误：没有捕获到数据响应。", file=sys.stderr)
+         return 2
+@@ -838,6 +1073,7 @@ def parse_args() -> argparse.Namespace:
+     ap.add_argument("--delay-ms", type=int, default=250, help="每次点击后的等待，默认 250ms")
+     ap.add_argument("--headful", action="store_true", help="显示浏览器窗口；GitHub Actions 建议配合 xvfb-run")
+     ap.add_argument("--cf-timeout-ms", type=int, default=45000, help="等待 Cloudflare 浏览器挑战的最长时间")
++    ap.add_argument("--api-probe-limit", type=int, default=80, help="最多探测多少个前端发现的只读 API 路径")
+     return ap.parse_args()
+ 
+ if __name__ == "__main__":

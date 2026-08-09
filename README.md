@@ -79,3 +79,18 @@ v2 会先把该 API 作为顶层页面打开，让浏览器有机会执行 Cloud
 - `manifest.json.page_load_failed`：曲目页是否仍加载失败
 
 如果 v2 仍持续返回 Cloudflare 403，说明站点策略直接拒绝 GitHub 托管 Runner 的出口 IP。此时最稳定的做法是换 GitHub self-hosted runner（你的电脑/家里小主机）或其他允许访问该站点的固定运行环境，而不是继续堆解析规则。
+
+## v3 诊断/直连模式
+
+v3 针对 GitHub Hosted Runner 上出现的特殊情况：`/api/tags/tree` 作为顶层页面访问能返回 200 JSON，但 `/songs` 内部的 `fetch` 仍可能加载失败。
+
+新增输出：
+
+- `tag_catalog.json`：标签目录（不会再误记为谱面投票）
+- `api_traffic.json`：所有同源 `/api/*` 请求的状态码/类型/响应前缀
+- `scripts/`：页面实际加载的同源 JS bundle
+- `frontend_api_strings.json`：从 JS bundle 中静态提取的 `/api/...` 字符串及上下文
+- `api_probes.json`：对发现的安全只读 API 进行顶层 GET 导航探测的结果
+- `browser_events.json`：console/pageerror/requestfailed 诊断
+
+只读 API 探测会跳过名称中包含登录、用户、投票、评论、更新、删除、上传等明显有副作用的接口。
